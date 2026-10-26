@@ -26,6 +26,9 @@ pipe = wan.WanI2VCausal(config=cfg, checkpoint_dir=args.ckpt_dir, device_id=0, r
                         t5_fsdp=False, dit_fsdp=False, use_sp=False, t5_cpu=os.environ.get("T5_CPU") == "1",
                         convert_model_dtype=False, local_attn_size=args.local_attn_size,
                         sink_size=args.sink_size, infer_mode="causal_fast", assets_dir=args.assets_dir)
+if os.environ.get("SPEC") == "1":
+    from spec_forcing import install as spec_install
+    spec_install(pipe)
 E4 = torch.float8_e4m3fn
 MODE = {"n1": False, "calib": False}
 TARGET = float(os.environ.get("AMAX_TARGET", "16"))
@@ -310,12 +313,20 @@ for tag, n1, calib, n2 in RUNS:
     if os.environ.get("TAE_LIVE") == "1":
         TAE_STATS.update(n=0, ms=0.0, frames=[], t_start=[], t_pix=[], last_start=None)
         _stream.reset()
+    prof = None
+    if os.environ.get("PROFILE") == "1" and tag == os.environ.get("PROFILE_TAG", RUNS[-1][0]):
+        prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+        prof.__enter__()
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
     video = pipe.generate(prompt, img, action_path=EXAMPLE, chunk_size=chunk, max_area=MAX_AREA_CONFIGS[args.size],
-                          frame_num=97, shift=args.sample_shift, seed=42, offload_model=False,
+                          frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=42, offload_model=False,
                           **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
     torch.cuda.synchronize(); t1 = time.perf_counter()
+    if prof is not None:
+        prof.__exit__(None, None, None)
+        from kestrel.timeline import summarize
+        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, t1 - t0)}), flush=True)
     out = f"{OUT}/{os.path.basename(EXAMPLE)}_{tag}_c{chunk}.mp4"
     save_video(tensor=video[None], save_file=out, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
     if os.environ.get("TAE_LIVE") == "1" and TAE_STATS["n"]:
