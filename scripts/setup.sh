@@ -11,9 +11,11 @@ git clone -q --depth 1 https://github.com/robbyant/lingbot-world-v2 $W/lingbot-w
 git clone -q --depth 1 https://github.com/madebyollin/taehv.git $W/taehv &
 git clone -q --depth 1 https://github.com/thu-ml/SageAttention.git $W/SageAttention &
 $V/hf download robbyant/lingbot-world-v2-1.3b-causal-fast --local-dir $W/models/lingbot13b > $W/logs/dl_dit.log 2>&1 &
-$V/hf download Wan-AI/Wan2.1-T2V-1.3B --include models_t5_umt5-xxl-enc-bf16.pth Wan2.1_VAE.pth "google/*" \
-  --local-dir $W/models/lingbot_assets > $W/logs/dl_assets.log 2>&1 &
+( $V/hf download Wan-AI/Wan2.1-T2V-1.3B models_t5_umt5-xxl-enc-bf16.pth Wan2.1_VAE.pth --local-dir $W/models/lingbot_assets &&
+  $V/hf download Wan-AI/Wan2.1-T2V-1.3B --include "google/*" --local-dir $W/models/lingbot_assets ) > $W/logs/dl_assets.log 2>&1 &
 wait
+test -s $W/models/lingbot_assets/models_t5_umt5-xxl-enc-bf16.pth
+test -s $W/models/lingbot_assets/Wan2.1_VAE.pth
 mkdir -p $W/models/lingbot13b/transformers
 mv $W/models/lingbot13b/model-0000* $W/models/lingbot13b/model.safetensors.index.json $W/models/lingbot13b/transformers/
 cd $W/lingbot-world-v2
@@ -25,4 +27,4 @@ $V/pip uninstall -y -q torch torchvision torchaudio || true
 $V/pip install -q -e $ROOT --no-deps
 cd $W/SageAttention && PATH=$V:/usr/local/cuda/bin:$PATH TORCH_CUDA_ARCH_LIST="12.0a" MAX_JOBS=32 EXT_PARALLEL=4 \
   NVCC_APPEND_FLAGS=--threads=8 $V/pip install --no-build-isolation -q .
-$V/python -c "import torch, sageattention, kestrel; print(torch.__version__)"
+cd $W && $V/python -c "import torch, sageattention, kestrel; print(torch.__version__)"
