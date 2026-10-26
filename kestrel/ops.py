@@ -18,3 +18,6 @@ def n2():
 
 def nvfp4():
     return _ext("nvfp4_quant")
+
+def fused_mod():
+    return _ext("fused_mod")
