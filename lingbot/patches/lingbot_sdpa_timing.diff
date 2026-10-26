@@ -1,0 +1,118 @@
+diff --git a/wan/image2video.py b/wan/image2video.py
+index dedc96b..0bf2de8 100644
+--- a/wan/image2video.py
++++ b/wan/image2video.py
+@@ -273,6 +273,10 @@ class WanI2VCausal:
+             dit_fsdp=dit_fsdp,
+             shard_fn=shard_fn,
+             convert_model_dtype=convert_model_dtype).to(self.device)
++        if os.environ.get("LB_COMPILE", "0") == "1":
++            for _blk in self.model.blocks:
++                _blk.compile()
++            logging.info("[LBT] torch.compile applied per DiT block")
+ 
+         self.scheduler = FlowUniPCMultistepScheduler(
+             num_train_timesteps=self.num_train_timesteps,
+@@ -776,6 +780,12 @@ class WanI2VCausal:
+             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
+             num_inference_chunk = len(latents_chunk)
+             pred_latent_chunks = []
++            _lbt = os.environ.get("LB_TIMING", "0") == "1"
++            def _lbsync():
++                if _lbt:
++                    torch.cuda.synchronize()
++                return time.perf_counter()
++            _lb_t_loop0 = _lbsync()
+             for chunk_id in tqdm(range(num_inference_chunk)):
+                 current_latent = latents_chunk[chunk_id]
+                 current_condition = condition_chunk[chunk_id]
+@@ -800,6 +810,14 @@ class WanI2VCausal:
+                 if offload_model:
+                     torch.cuda.empty_cache()
+ 
++                _lb_prof = None
++                if int(os.environ.get("LB_PROFILE_CHUNK", "-1")) == chunk_id:
++                    torch.cuda.synchronize()
++                    _lb_prof = torch.profiler.profile(activities=[
++                        torch.profiler.ProfilerActivity.CPU,
++                        torch.profiler.ProfilerActivity.CUDA])
++                    _lb_prof.__enter__()
++                _lb_t0 = _lbsync()
+                 for timestep_idx in range(len(timesteps)):
+                     latent_model_input = [current_latent.to(self.device)]
+                     current_timestep = [timesteps[timestep_idx]]
+@@ -829,6 +847,7 @@ class WanI2VCausal:
+                         # note return x0
+                         break
+ 
++                _lb_t1 = _lbsync()
+                 pred_latent_chunks.append(x0)
+ 
+                 # Update kv cache
+@@ -837,15 +856,34 @@ class WanI2VCausal:
+                 self.model(x=[x0], t=timestep,
+                            cross_attn_first_call=False,
+                            **kwargs)
++                _lb_t2 = _lbsync()
++                if _lbt:
++                    logging.info(f"[LBT] chunk {chunk_id} denoise_s={_lb_t1-_lb_t0:.4f} steps={timestep_idx+1} kvupdate_s={_lb_t2-_lb_t1:.4f} chunk_total_s={_lb_t2-_lb_t0:.4f} latent_frames={x0.shape[1]}")
++                if _lb_prof is not None:
++                    torch.cuda.synchronize()
++                    _lb_prof.__exit__(None, None, None)
++                    _lb_outdir = os.environ.get("LB_PROFILE_DIR", ".")
++                    with open(os.path.join(_lb_outdir, "kernel_census.txt"), "w") as _f:
++                        _f.write(f"chunk {chunk_id}: denoise_s={_lb_t1-_lb_t0:.4f} kvupdate_s={_lb_t2-_lb_t1:.4f} wall_s={_lb_t2-_lb_t0:.4f} (profiler on)\n")
++                        _f.write(_lb_prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
++                    _lb_prof.export_chrome_trace(os.path.join(_lb_outdir, "trace_chunk.json"))
++                    logging.info(f"[LBT] profiled chunk {chunk_id} -> {_lb_outdir}")
+ 
+             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
++            _lb_t_loop1 = _lbsync()
++            if _lbt:
++                logging.info(f"[LBT] dit_loop_total_s={_lb_t_loop1-_lb_t_loop0:.4f} chunks={num_inference_chunk} latent_frames={pred_latent_chunks.shape[1]} peak_mem_GB={torch.cuda.max_memory_allocated()/1e9:.2f}")
+ 
+             if offload_model:
+                 self.model.cpu()
+                 torch.cuda.empty_cache()
+ 
+             if self.rank == 0:
++                _lb_v0 = _lbsync()
+                 videos = self.vae.decode([pred_latent_chunks])
++                _lb_v1 = _lbsync()
++                if _lbt:
++                    logging.info(f"[LBT] vae_decode_s={_lb_v1-_lb_v0:.4f} video_frames={videos[0].shape[1]} peak_mem_GB={torch.cuda.max_memory_allocated()/1e9:.2f}")
+ 
+         # del noise, latent, x0
+         # del sample_scheduler
+diff --git a/wan/modules/attention.py b/wan/modules/attention.py
+index c84d9e5..05d71c2 100644
+--- a/wan/modules/attention.py
++++ b/wan/modules/attention.py
+@@ -52,6 +52,27 @@ def flash_attention(
+     assert dtype in half_dtypes
+     assert q.device.type == 'cuda' and q.size(-1) <= 256
+ 
++    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
++        assert window_size == (-1, -1), 'SDPA fallback: window_size unsupported'
++        out_dtype = q.dtype
++        b, lq = q.size(0), q.size(1)
++        out = q.new_zeros(q.shape[:-1] + (v.size(-1),), dtype=out_dtype)
++        for i in range(b):
++            ql = lq if q_lens is None else int(q_lens[i])
++            kl = k.size(1) if k_lens is None else int(k_lens[i])
++            qi = q[i:i + 1, :ql]
++            if q_scale is not None:
++                qi = qi * q_scale
++            qi = qi.to(dtype if qi.dtype not in half_dtypes else qi.dtype)
++            ki = k[i:i + 1, :kl].to(qi.dtype)
++            vi = v[i:i + 1, :kl].to(qi.dtype)
++            oi = torch.nn.functional.scaled_dot_product_attention(
++                qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2),
++                dropout_p=dropout_p, is_causal=causal, scale=softmax_scale,
++                enable_gqa=(qi.size(2) != ki.size(2)))
++            out[i, :ql] = oi.transpose(1, 2).to(out_dtype)
++        return out
++
+     # params
+     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
+ 

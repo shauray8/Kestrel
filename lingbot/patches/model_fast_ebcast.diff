@@ -1,0 +1,23 @@
+--- a/wan/modules/model_fast.py
++++ b/wan/modules/model_fast.py
+@@ -1,3 +1,4 @@
++import os
+ """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
+ import math
+ from einops import rearrange
+@@ -558,13 +559,13 @@
+ 
+         # time embeddings
+         if t.dim() == 1:
+-            t = t.expand(t.size(0), seq_lens)
++            t = t[:, None] if os.environ.get("KESTREL_E_BCAST") == "1" else t.expand(t.size(0), seq_lens)
+         with torch.amp.autocast('cuda', dtype=torch.float32):
+             bt = t.size(0)
+             t = t.flatten()
+             e = self.time_embedding(
+                 sinusoidal_embedding_1d(self.freq_dim,
+-                                        t).unflatten(0, (bt, seq_lens)).float())
++                                        t).unflatten(0, (bt, t.numel() // bt)).float())
+             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+             assert e.dtype == torch.float32 and e0.dtype == torch.float32
+ 
