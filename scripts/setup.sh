@@ -25,6 +25,7 @@ grep -v -E "^(torch|torchvision|torchaudio|flash_attn|flash-attn)" requirements.
 $V/pip install -q -r /tmp/req.txt einops
 $V/pip uninstall -y -q torch torchvision torchaudio || true
 $V/pip install -q -e $ROOT --no-deps
-cd $W/SageAttention && PATH=$V:/usr/local/cuda/bin:$PATH TORCH_CUDA_ARCH_LIST="12.0a" MAX_JOBS=32 EXT_PARALLEL=4 \
+$V/pip install -q -r $ROOT/eval/requirements.txt
+cd $W/SageAttention && git apply $ROOT/lingbot/patches/sage_stream.diff && PATH=$V:/usr/local/cuda/bin:$PATH TORCH_CUDA_ARCH_LIST="12.0a" MAX_JOBS=12 EXT_PARALLEL=2 \
   NVCC_APPEND_FLAGS=--threads=8 $V/pip install --no-build-isolation -q .
 cd $W && $V/python -c "import torch, sageattention, kestrel; print(torch.__version__)"
