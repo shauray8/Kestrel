@@ -153,9 +153,10 @@ __global__ void __launch_bounds__(THREADS, 1) n1_a16(const __nv_bfloat16 *__rest
   }
 }
 
+template <int EPI>
 __global__ void __launch_bounds__(THREADS, 2) n1_f8(const uint8_t *__restrict__ X, const uint8_t *__restrict__ W,
                                                     const float *__restrict__ sw, const __nv_bfloat16 *__restrict__ bias,
-                                                    __nv_bfloat16 *__restrict__ Y, int M, int N, int K, float sa) {
+                                                    void *__restrict__ Yv, int M, int N, int K, float sa, float out_inv) {
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t *sA = smem, *sB = smem + STAGES * A_BYTES;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp / WN, wn = warp % WN;
@@ -236,8 +237,16 @@ __global__ void __launch_bounds__(THREADS, 2) n1_f8(const uint8_t *__restrict__ 
 #pragma unroll
     for (int i = 0; i < MI; i++) {
       const int row = m0 + wm * TM + i * 16 + g;
-      if (row < M) *reinterpret_cast<__nv_bfloat162 *>(Y + (size_t)row * N + col) = __floats2bfloat162_rn(f[i][j][0] * s0 + b0, f[i][j][1] * s1 + b1);
-      if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(Y + (size_t)(row + 8) * N + col) = __floats2bfloat162_rn(f[i][j][2] * s0 + b0, f[i][j][3] * s1 + b1);
+      const float v0 = f[i][j][0] * s0 + b0, v1 = f[i][j][1] * s1 + b1, v2 = f[i][j][2] * s0 + b0, v3 = f[i][j][3] * s1 + b1;
+      if constexpr (EPI == 0) {
+        __nv_bfloat16 *Y = reinterpret_cast<__nv_bfloat16 *>(Yv);
+        if (row < M) *reinterpret_cast<__nv_bfloat162 *>(Y + (size_t)row * N + col) = __floats2bfloat162_rn(v0, v1);
+        if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(Y + (size_t)(row + 8) * N + col) = __floats2bfloat162_rn(v2, v3);
+      } else {
+        uint8_t *Y = reinterpret_cast<uint8_t *>(Yv);
+        if (row < M) *reinterpret_cast<uint16_t *>(Y + (size_t)row * N + col) = q2(gelu_tanh(v0), gelu_tanh(v1), out_inv);
+        if (row + 8 < M) *reinterpret_cast<uint16_t *>(Y + (size_t)(row + 8) * N + col) = q2(gelu_tanh(v2), gelu_tanh(v3), out_inv);
+      }
     }
   }
 }
@@ -272,28 +281,37 @@ torch::Tensor n1_linear_gelu_f8(torch::Tensor x, torch::Tensor wq, torch::Tensor
   return run_a16<1>(x, wq, sw, bias, sa, out_scale);
 }
 
-torch::Tensor n1_linear_f8in(torch::Tensor x, torch::Tensor wq, torch::Tensor sw, c10::optional<torch::Tensor> bias, double sa) {
+template <int EPI>
+torch::Tensor run_f8(torch::Tensor x, torch::Tensor wq, torch::Tensor sw, c10::optional<torch::Tensor> bias, double sa, double out_scale) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat8_e4m3fn && x.is_contiguous());
+  TORCH_CHECK(wq.scalar_type() == torch::kFloat8_e4m3fn && wq.is_contiguous());
   const int K = x.size(-1), N = wq.size(0);
   TORCH_CHECK(wq.size(1) == K && K % BK == 0 && N % BN == 0, "shape");
   const int M = x.numel() / K;
-  auto y = torch::empty({M, N}, x.options().dtype(torch::kBFloat16));
+  auto y = torch::empty({M, N}, x.options().dtype(EPI == 0 ? torch::kBFloat16 : torch::kFloat8_e4m3fn));
   const __nv_bfloat16 *bp = nullptr;
   if (bias.has_value()) bp = reinterpret_cast<const __nv_bfloat16 *>(bias->data_ptr());
   const int smem = STAGES * (A_BYTES + B_BYTES);
   static bool init = false;
-  if (!init) { cudaFuncSetAttribute(n1_f8, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); init = true; }
+  if (!init) { cudaFuncSetAttribute(n1_f8<EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); init = true; }
   const int blocks = ((M + BM - 1) / BM) * (N / BN);
-  n1_f8<<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+  n1_f8<EPI><<<blocks, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const uint8_t *>(x.data_ptr()), reinterpret_cast<const uint8_t *>(wq.data_ptr()), sw.data_ptr<float>(), bp,
-      reinterpret_cast<__nv_bfloat16 *>(y.data_ptr()), M, N, K, float(sa));
+      y.data_ptr(), M, N, K, float(sa), float(1.0 / out_scale));
   auto sizes = x.sizes().vec();
   sizes.back() = N;
   return y.view(sizes);
+}
+torch::Tensor n1_linear_f8in(torch::Tensor x, torch::Tensor wq, torch::Tensor sw, c10::optional<torch::Tensor> bias, double sa) {
+  return run_f8<0>(x, wq, sw, bias, sa, 1.0);
+}
+torch::Tensor n1_linear_f8in_gelu_f8(torch::Tensor x, torch::Tensor wq, torch::Tensor sw, c10::optional<torch::Tensor> bias, double sa, double out_scale) {
+  return run_f8<1>(x, wq, sw, bias, sa, out_scale);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("n1_linear", &n1_linear, "FP8 ladder linear with fused activation quantization");
   m.def("n1_linear_gelu_f8", &n1_linear_gelu_f8, "FP8 ladder linear + tanh-GELU, e4m3 output");
   m.def("n1_linear_f8in", &n1_linear_f8in, "FP8 ladder linear, e4m3 input");
+  m.def("n1_linear_f8in_gelu_f8", &n1_linear_f8in_gelu_f8, "FP8 ladder linear + tanh-GELU, e4m3 input/output");
 }
