@@ -1,4 +1,6 @@
-import json, os, random, sys, time
+import collections, fcntl, hashlib, json, os, random, sys, time
+
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 MODELS = os.environ.get("KESTREL_MODELS", "/workspace/models")
 OUT = os.environ.get("KESTREL_OUT", "/workspace/samples/kestrel")
@@ -23,14 +25,32 @@ args = _parse_args()
 _init_logging(0)
 cfg = WAN_CONFIGS[args.task]
 pipe = wan.WanI2VCausal(config=cfg, checkpoint_dir=args.ckpt_dir, device_id=0, rank=0,
-                        t5_fsdp=False, dit_fsdp=False, use_sp=False, t5_cpu=os.environ.get("T5_CPU") == "1",
+                        t5_fsdp=False, dit_fsdp=False, use_sp=False, t5_cpu=True,
                         convert_model_dtype=False, local_attn_size=args.local_attn_size,
                         sink_size=args.sink_size, infer_mode="causal_fast", assets_dir=args.assets_dir)
+
+class T5Offload:
+    def __init__(self, enc):
+        self.enc = enc
+
+    def __getattr__(self, name):
+        return getattr(self.enc, name)
+
+    def __call__(self, texts, device):
+        out = self.enc(texts, device)
+        self.enc.model.cpu()
+        torch.cuda.empty_cache()
+        return out
+
+if os.environ.get("T5_CPU") != "1":
+    pipe.t5_cpu = False
+    pipe.text_encoder = T5Offload(pipe.text_encoder)
 if os.environ.get("SPEC") == "1":
     from spec_forcing import install as spec_install
     spec_install(pipe)
 E4 = torch.float8_e4m3fn
 MODE = {"n1": False, "calib": False}
+PATHS = collections.Counter()
 TARGET = float(os.environ.get("AMAX_TARGET", "16"))
 
 class N1Linear(nn.Module):
@@ -49,7 +69,9 @@ class N1Linear(nn.Module):
         if MODE["calib"]:
             self.amax = max(self.amax, float(x.detach().abs().max()))
         if not (MODE["n1"] and self.ok and self.amax > 0):
+            PATHS["linear_bf16"] += 1
             return self.lin(x)
+        PATHS["linear_n1"] += 1
         xb = x.to(torch.bfloat16).contiguous()
         y = ext.n1_linear(xb, self.wq, self.sw, self.bias_bf16, self.amax / TARGET)
         return y.to(x.dtype)
@@ -70,10 +92,18 @@ class FusedFFN(nn.Module):
 
     def forward(self, x):
         if MODE["n1"] and MODE.get("fused_ffn") and self.l0.ok and self.l2.ok and self.l0.amax > 0 and self.l2.amax > 0:
+            PATHS["ffn_fused"] += 1
             s_mid = self.l2.amax / TARGET
             y8 = ext.n1_linear_gelu_f8(x.to(torch.bfloat16).contiguous(), self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
             return ext.n1_linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(x.dtype)
+        PATHS["ffn_unfused"] += 1
         return self.l2(self.act(self.l0(x)))
+
+    def forward_fp8(self, x):
+        PATHS["ffn_fp8in"] += 1
+        s_mid = self.l2.amax / TARGET
+        y8 = ext.n1_linear_f8in_gelu_f8(x, self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
+        return ext.n1_linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(torch.bfloat16)
 
 if os.environ.get("FUSED_FFN") == "1":
     for blk in pipe.model.blocks:
@@ -180,13 +210,23 @@ if os.environ.get("FUSED_GLUE") == "1":
             x2 = x.view(B * L, C)
         ca = self.cross_attn(self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache,
                              cross_attn_first_call=cross_attn_first_call)
-        hin = fmod.residual_then_mod_norm(x2, ca.reshape(B * L, C).to(torch.bfloat16).contiguous(), None,
-                                          ev[3].contiguous(), ev[4].contiguous(), self.norm2.eps)
-        y = self.ffn(hin.view(B, L, C))
+        if (os.environ.get("FP8_GLUE") == "1" and isinstance(self.ffn, FusedFFN) and MODE["n1"] and
+                self.ffn.l0.ok and self.ffn.l2.ok and self.ffn.l0.amax > 0 and self.ffn.l2.amax > 0):
+            hin = fmod.residual_then_mod_norm_fp8(x2, ca.reshape(B * L, C).to(torch.bfloat16).contiguous(), None,
+                                                  ev[3].contiguous(), ev[4].contiguous(), self.norm2.eps, self.ffn.l0.amax / TARGET)
+            y = self.ffn.forward_fp8(hin.view(B, L, C))
+        else:
+            hin = fmod.residual_then_mod_norm(x2, ca.reshape(B * L, C).to(torch.bfloat16).contiguous(), None,
+                                              ev[3].contiguous(), ev[4].contiguous(), self.norm2.eps)
+            y = self.ffn(hin.view(B, L, C))
         fmod.gated_residual(x2, y.reshape(B * L, C).to(torch.bfloat16).contiguous(), ev[5].contiguous())
         return x
 
     _mf_glue.CausalWanAttentionBlock.forward = _glue_block_forward
+
+if os.environ.get("VM_FFN") == "1":
+    from vm_hook import install as vm_ffn_install
+    vm_ffn_install(globals())
 
 ATTN_IMPL = os.environ.get("ATTN", "n2")
 if ATTN_IMPL in ("sage2", "kvq"):
@@ -213,13 +253,17 @@ ext2 = ops.n2()
 _orig_attention = mf.attention
 
 def n2_attention(q, k, v, *a, **kw):
-    if not MODE.get("n2") or q.shape[0] != 1 or q.shape[-1] != 128 or a or kw:
+    if not MODE.get("n2") or ATTN_IMPL == "sdpa" or q.shape[0] != 1 or q.shape[-1] != 128 or a or kw:
+        PATHS["attn_stock_" + ("off" if not MODE.get("n2") else "args" if a or kw else "sdpa" if ATTN_IMPL == "sdpa" else "shape")] += 1
         return _orig_attention(q, k, v, *a, **kw)
     if ATTN_IMPL == "kvq" and k.shape[1] > q.shape[1]:
+        PATHS["attn_kvq"] += 1
         layer = KVQ_STATE["layer"]; KVQ_STATE["layer"] += 1
         return KVQ(layer, q, k, v).to(q.dtype)
     if ATTN_IMPL in ("sage2", "kvq"):
+        PATHS["attn_sage2"] += 1
         return sageattn(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD", is_causal=False).to(q.dtype)
+    PATHS["attn_n2"] += 1
     o = ext2.n2_attention(q[0].half().contiguous(), k[0].half().contiguous(), v[0].half().contiguous())
     return o[None].to(q.dtype)
 
@@ -298,6 +342,18 @@ if os.environ.get("ROPE32") == "1":
     mf.causal_rope_apply = rope32
     RUNS_OVERRIDE = [(t + "_rope32", a, b, c) for t, a, b, c in (RUNS_OVERRIDE or [("n2_calib", False, True, True), ("n1n2", True, False, True)])]
 
+if os.environ.get("ROPE_KV") == "1":
+    from ropekv_hook import install as ropekv_install
+    ropekv_install(mf, ops)
+if os.environ.get("XATTN") == "1":
+    from xattn import install as xattn_install
+    xattn_install(mf)
+
+GR = None
+if os.environ.get("GRAPHS"):
+    from graphs import Graphs
+    GR = Graphs(pipe.model, lambda: not MODE["calib"])
+
 os.makedirs(OUT, exist_ok=True)
 prompt = open(f"{EXAMPLE}/prompt.txt").read().strip()
 img = Image.open(f"{EXAMPLE}/image.jpg").convert("RGB")
@@ -305,8 +361,36 @@ RUNS = RUNS_OVERRIDE or [("bf16_calib", False, True, False), ("bf16", False, Fal
                          ("n2", False, False, True), ("n1n2", True, False, True)]
 if os.environ.get("FP4_FFN") == "1":
     RUNS = list(RUNS) + [(RUNS[-1][0] + "_fp4", True, False, True)]
+if os.environ.get("ONLY"):
+    RUNS = [r for r in RUNS if r[0] in os.environ["ONLY"].split(",")]
+if os.environ.get("KESTREL_GPU_LOCK"):
+    _gpu_lock = open(os.environ["KESTREL_GPU_LOCK"], "w")
+    fcntl.flock(_gpu_lock, fcntl.LOCK_EX)
+
+def after_calib():
+    if os.environ.get("FP4_FFN") == "1":
+        for m in FP4_MODS:
+            m.prepare()
+    if os.environ.get("FREE_BF16_W", "1") == "1":
+        for m in mods:
+            if m.ok and m.amax > 0 and m.lin.weight.numel():
+                m.lin.weight.data = torch.empty(0, device=m.lin.weight.device, dtype=m.lin.weight.dtype)
+        torch.cuda.empty_cache()
+
+CALIB_FILE = None
+if os.environ.get("CALIB_CACHE"):
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "AMAX_TARGET", "SPEC", "ROPE_KV", "XATTN")
+    _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
+    CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
+    if os.path.exists(CALIB_FILE):
+        for m, a in zip(mods, json.load(open(CALIB_FILE))):
+            m.amax = a
+        RUNS = [r for r in RUNS if not r[2]]
+        CALIB_FILE = None
+        after_calib()
+        print(json.dumps({"exp": "calib_cache", "hit": True, "key": _key}), flush=True)
 for tag, n1, calib, n2 in RUNS:
-    MODE.update(n1=n1, calib=calib, n2=n2, tae=(n1 and not calib), fp4=tag.endswith("_fp4"))
+    MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
     for m in CAM.get("mods", []):
         m.key, m.val = None, None
     CAM.update(hits=0, miss=0)
@@ -335,8 +419,9 @@ for tag, n1, calib, n2 in RUNS:
                    nrow=1, normalize=True, value_range=(-1, 1))
         ts, tp = TAE_STATS["t_start"], TAE_STATS["t_pix"]
         k = min(len(ts), len(tp))
+        s0 = min(4, k // 2)
         rng = random.Random(0)
-        lo, hi = ts[min(4, k - 2)], ts[k - 1]
+        lo, hi = ts[s0], ts[k - 1]
         lat = []
         for _ in range(20000):
             e = rng.uniform(lo, hi)
@@ -346,19 +431,20 @@ for tag, n1, calib, n2 in RUNS:
         gen = [tp[i] - ts[i] for i in range(k)]
         print(json.dumps({"exp": "tae_live", "latents": TAE_STATS["n"], "frames_out": int(live.shape[0]),
                           "tae_ms_per_latent": round(TAE_STATS["ms"] / TAE_STATS["n"], 2),
-                          "chunk_start_to_first_pixel_ms_median": round(1e3 * sorted(gen[4:])[len(gen[4:]) // 2], 1),
+                          "chunk_start_to_first_pixel_ms_median": round(1e3 * sorted(gen[s0:])[len(gen[s0:]) // 2], 1),
                           "input_to_pixels_ms": {"mean": round(1e3 * sum(lat) / len(lat), 1), "p50": round(1e3 * lat[len(lat) // 2], 1),
                                                  "p95": round(1e3 * lat[int(0.95 * len(lat))], 1), "max": round(1e3 * lat[-1], 1)},
                           "fps_e2e": round(4 * TAE_STATS["n"] / (tp[k - 1] - ts[0]), 2)}), flush=True)
     print(json.dumps({"exp": "n1_e2e", "tag": tag, "generate_s": round(t1 - t0, 2), "out": out}), flush=True)
+    print(json.dumps({"exp": "paths", "tag": tag, **dict(sorted(PATHS.items()))}), flush=True)
+    PATHS.clear()
+    if GR:
+        GR.report(tag); GR.reset()
     if not pipe.t5_cpu and next(pipe.text_encoder.model.parameters()).is_cuda:
         pipe.text_encoder.model.cpu()
         torch.cuda.empty_cache()
-    if calib and os.environ.get("FP4_FFN") == "1":
-        for m in FP4_MODS:
-            m.prepare()
-    if calib and os.environ.get("FREE_BF16_W", "1") == "1":
-        for m in mods:
-            if m.ok and m.amax > 0 and m.lin.weight.numel():
-                m.lin.weight.data = torch.empty(0, device=m.lin.weight.device, dtype=m.lin.weight.dtype)
-        torch.cuda.empty_cache()
+    if calib:
+        after_calib()
+        if CALIB_FILE:
+            os.makedirs(os.path.dirname(CALIB_FILE), exist_ok=True)
+            json.dump([m.amax for m in mods], open(CALIB_FILE, "w"))
