@@ -1,0 +1,121 @@
+{
+  "common": {
+    "CHUNK": "2",
+    "TAE_LIVE": "1",
+    "LB_TIMING": "1",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "CALIB_CACHE": "/workspace/calib"
+  },
+  "variants": {
+    "stock": {
+      "FREE_BF16_W": "0",
+      "ONLY": "bf16"
+    },
+    "n1n2": {
+      "FREE_BF16_W": "0",
+      "ONLY": "n1n2"
+    },
+    "glue_sdpa": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sdpa",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "glue_n2": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "n2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "glue_sage2": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "glue_sage2_spec": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "SPEC": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "glue_sage2_graphs": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "GRAPHS": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "best": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ROPE_KV": "1",
+      "XATTN": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "best_spec": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ROPE_KV": "1",
+      "XATTN": "1",
+      "SPEC": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "best_graphs": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ROPE_KV": "1",
+      "XATTN": "1",
+      "GRAPHS": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
+    "stock_graphs": {
+      "FREE_BF16_W": "0",
+      "ONLY": "bf16",
+      "GRAPHS": "1"
+    },
+    "drift30_stock": {
+      "FREE_BF16_W": "0",
+      "ONLY": "bf16",
+      "FRAMES": "481"
+    },
+    "drift30_best": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage2",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "FRAMES": "481",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    }
+  }
+}
