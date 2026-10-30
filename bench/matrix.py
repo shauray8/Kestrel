@@ -24,6 +24,12 @@ def overrides(items):
         out[key] = value
     return out
 
+def variant_config(presets, variant, extra, out):
+    config = {**presets["common"], **presets["variants"][variant], **extra}
+    config["KESTREL_OUT"] = str(out)
+    config.setdefault("KESTREL_GPU_LOCK", LOCK)
+    return config
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rundir")
@@ -48,17 +54,15 @@ def main():
     for variant in args.variants:
         out = rundir / "videos" / variant
         out.mkdir(parents=True, exist_ok=True)
+        config = variant_config(presets, variant, extra, out)
         env = os.environ.copy()
-        env.update(presets["common"])
-        env.update(presets["variants"][variant])
-        env.update(extra)
-        env["KESTREL_OUT"] = str(out)
-        command = ["flock", LOCK, sys.executable, str(ROOT / "lingbot" / "run.py")]
+        env.update(config)
+        command = [sys.executable, str(ROOT / "lingbot" / "run.py")]
         env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
         started = now()
         with (rundir / f"{variant}.log").open("w") as log:
             rc = subprocess.call(command, cwd=args.lingbot, env=env, stdout=log, stderr=subprocess.STDOUT)
-        record = {"variant": variant, "git_commit": sha, "env": env, "command": command,
+        record = {"variant": variant, "git_commit": sha, "env": config, "command": command,
                   "cwd": str(Path(args.lingbot).resolve()), "start_time": started, "end_time": now(), "rc": rc}
         (rundir / f"{variant}.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
         print(json.dumps({k: record[k] for k in ("variant", "rc", "start_time", "end_time")}, separators=(",", ":")), flush=True)
@@ -73,7 +77,7 @@ def main():
         print(json.dumps({"quality_rc": None, "error": f"expected one {args.ref} bf16 video, found {len(ref_videos)}"}), flush=True)
         failed = True
     elif candidates:
-        command = ["flock", LOCK, sys.executable, str(ROOT / "eval" / "quality.py"), "--ref", str(ref_videos[0]), *map(str, candidates)]
+        command = ["flock", extra.get("KESTREL_GPU_LOCK", LOCK), sys.executable, str(ROOT / "eval" / "quality.py"), "--ref", str(ref_videos[0]), *map(str, candidates)]
         with quality.open("w") as out, (rundir / "quality.log").open("w") as err:
             rc = subprocess.call(command, stdout=out, stderr=err)
         print(json.dumps({"quality_rc": rc, "videos": len(candidates)}), flush=True)
