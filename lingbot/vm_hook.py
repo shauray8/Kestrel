@@ -56,6 +56,35 @@ def install(g):
             p.checked = True
         PATHS["ffn_vm"] += 1
 
+    warmed = False
+
+    def warmup():
+        nonlocal warmed
+        if warmed:
+            return
+        M = int(os.environ.get("CHUNK", "3")) * 30 * 52
+        made, bufs = set(), {}
+        for blk in pipe.model.blocks:
+            if not isinstance(blk.ffn, FusedFFN):
+                continue
+            C = blk.ffn.l0.wq.size(1)
+            for R in (1, M):
+                shape = (M, C, R)
+                if shape not in bufs:
+                    x = torch.empty(M, C, dtype=torch.float32, device=blk.ffn.l0.wq.device)
+                    ca = torch.empty(M, C, dtype=torch.bfloat16, device=x.device)
+                    bufs[shape] = (x, ca, [torch.empty(R, C, dtype=torch.float32, device=x.device) for _ in range(3)])
+                x, ca, mods = bufs[shape]
+                key = (M, C, R, blk.norm2.eps)
+                amax = (blk.ffn.l0.amax or TARGET, blk.ffn.l2.amax or TARGET)
+                setup(blk, x, ca, mods, key, amax)
+                made.add(key)
+        warmed = True
+        print(f'{{"exp": "vm_warmup", "programs": {len(made)}}}', flush=True)
+
+    pipe = g["pipe"]
+    g["VM_WARMUP"] = warmup
+
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict=None, kv_cache=None,
                 crossattn_cache=None, current_start=0, max_attention_size=1_000_000, frame_seqlen=None,
                 cross_attn_first_call=None, seq_lens_int=None):

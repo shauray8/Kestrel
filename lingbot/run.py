@@ -376,6 +376,8 @@ def after_calib():
             if m.ok and m.amax > 0 and m.lin.weight.numel():
                 m.lin.weight.data = torch.empty(0, device=m.lin.weight.device, dtype=m.lin.weight.dtype)
         torch.cuda.empty_cache()
+    if "VM_WARMUP" in globals():
+        VM_WARMUP()
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
