@@ -162,17 +162,21 @@ def install(pipe):
         S["k"] = k = S["k"] + 1
         K, (f, h, w), committed = S["K"], S["grid"], S["committed"]
         act = ~committed
-        na = int(act.sum())
-        if k == 1 or na > f * h * w - PAD:
+        if k == 1:
+            na = f * h * w
             pred = inner(*a, **kw)[0]
-        elif na == 0:
-            pred = torch.zeros_like(xt)
         else:
-            if S["sp"] is None:
-                cos, sin = _rope_table(model.freqs, f, h, w, kw["current_start"] // kw["frame_seqlen"])
-                S["sp"] = {"cos_full": cos, "sin_full": sin, "lend": int(kw["kv_cache"][0]["local_end_index"])}
             idx = act.flatten().nonzero()[:, 0]
-            pred = _sparse_forward(model, kw, torch.cat([idx, idx[-1:].expand((-na) % PAD)]), (f, h, w), S["sp"])
+            na = idx.numel()
+            if na > f * h * w - PAD:
+                pred = inner(*a, **kw)[0]
+            elif na == 0:
+                pred = torch.zeros_like(xt)
+            else:
+                if S["sp"] is None:
+                    cos, sin = _rope_table(model.freqs, f, h, w, kw["current_start"] // kw["frame_seqlen"])
+                    S["sp"] = {"cos_full": cos, "sin_full": sin, "lend": int(kw["kv_cache"][0]["local_end_index"])}
+                pred = _sparse_forward(model, kw, torch.cat([idx, idx[-1:].expand((-na) % PAD)]), (f, h, w), S["sp"])
         S["act"][k - 1] += na
         ts = pipe.scheduler.timesteps.to(xt.device).double()
         sigma = pipe.scheduler.sigmas.to(xt.device).double()[torch.argmin((ts - t.double()).abs())]

@@ -379,7 +379,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "AMAX_TARGET", "SPEC", "ROPE_KV", "XATTN")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "XATTN")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):
@@ -404,7 +404,7 @@ for tag, n1, calib, n2 in RUNS:
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
     video = pipe.generate(prompt, img, action_path=EXAMPLE, chunk_size=chunk, max_area=MAX_AREA_CONFIGS[args.size],
-                          frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=42, offload_model=False,
+                          frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=int(os.environ.get("SEED", "42")), offload_model=False,
                           **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
     torch.cuda.synchronize(); t1 = time.perf_counter()
     if prof is not None:
