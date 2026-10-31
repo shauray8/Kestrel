@@ -307,7 +307,7 @@ __device__ __forceinline__ bool op_rows_c(const Instr &I, const Tens *T) {
 
 __device__ __forceinline__ bool op_kv_advance(const Instr &I, const Tens *T) {
   const Tens K = T[0], V = T[1];
-  const int rows = (int)I.eps;
+  const int rows = (int)I.f;
   if (rows <= 0 || K.dtype != DT_BF16 || V.dtype != DT_BF16 || K.rows != V.rows || K.cols != V.cols || K.cols % 8 ||
       K.stride % 8 || V.stride % 8 || I.m < 0 || I.n <= I.m || I.n + rows > K.rows) return false;
   const int vecs = K.cols / 8;
