@@ -1,3 +1,4 @@
+import math
 import struct
 from functools import cache
 
@@ -5,10 +6,10 @@ import torch
 
 from kestrel import ops
 
-HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE = range(9)
-OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance")
+HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE, ATTN_WINDOW = range(10)
+OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window")
 ERRORS = ("ok", "timeout", "opcode", "overflow")
-BM, BN, RB, MAXT = 128, 128, 8, 16
+BM, BN, RB, AQ, MAXT = 128, 128, 8, 64, 16
 _DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2}
 
 def _cdiv(a, b):
@@ -104,6 +105,15 @@ class Program:
         for i in range(len(tiles) - stride):
             self.edge(tiles[i], tiles[i + stride])
         return tiles
+    def attn_window(self, q, k, v, out, after=None):
+        Lq, C, dq = self.shapes[q]
+        Lk, Ck, dk = self.shapes[k]
+        assert dq == dk == self.shapes[v][2] == self.shapes[out][2] == torch.bfloat16
+        assert C > 0 and C % 128 == 0 and self.shapes[v] == (Lk, C, dq) and self.shapes[out] == (Lq, C, dq) and Ck == C
+        scale_log2 = math.log2(math.e) / math.sqrt(128)
+        return self._stage(lambda: [[self.add(ATTN_WINDOW, m, h, (q, k, v, out), scale_log2,
+                                                  after=after(m, h) if after else ())
+                                     for h in range(C // 128)] for m in range(_cdiv(Lq, AQ))])
 
     def window(self, tiles, w):
         for m in range(w or len(tiles), len(tiles)):

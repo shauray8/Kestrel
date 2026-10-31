@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from kestrel import ops, vm
 
-n1, fm, ext, rope = ops.n1(), ops.fused_mod(), ops.vm(), ops.rope_kv()
+n1, n2, fm, ext, rope = ops.n1(), ops.n2(), ops.fused_mod(), ops.vm(), ops.rope_kv()
 if "--build-only" in sys.argv:
     sys.exit(0)
 E4, BF, D, FF, FRAME, TARGET, EPS = torch.float8_e4m3fn, torch.bfloat16, 1536, 8960, 1560, 16.0, 1e-6
@@ -173,6 +173,26 @@ def kv_advance_case(rows=400, width=1536, sink=32, drop=32):
     r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["k_mismatch"] == 0 and r["v_mismatch"] == 0
     emit(r)
     return r["pass"]
+def attn_window_case(Lq=127, Lk=193, H=4):
+    g = torch.Generator(device="cuda").manual_seed(6)
+    q = torch.randn(Lq, H * 128, device="cuda", dtype=BF, generator=g)
+    k, v = (torch.randn(Lk, H * 128, device="cuda", dtype=BF, generator=g) for _ in range(2))
+    ref = n2.n2_attention(q.view(1, Lq, H, 128).half(), k.view(1, Lk, H, 128).half(),
+                          v.view(1, Lk, H, 128).half()).to(BF).view_as(q)
+    out = torch.empty_like(q)
+    p = vm.Program()
+    qi, ki, vi, oi = (p.tensor(t) for t in (q, k, v, out))
+    p.attn_window(qi, ki, vi, oi)
+    p.build()
+    p.run()
+    torch.cuda.synchronize()
+    st = p.status()
+    r = {"test": "vm_attn_window", "Lq": Lq, "Lk": Lk, "H": H, **st,
+         "mismatch_vs_n2": diff(out, ref), "rel_vs_n2": rel(out, ref)}
+    r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["mismatch_vs_n2"] == 0
+    emit(r)
+    return r["pass"]
+
 
 def cycle_case(M=3120, timeout_ms=50.0):
     g = torch.Generator(device="cuda").manual_seed(2)
@@ -199,7 +219,8 @@ def cycle_case(M=3120, timeout_ms=50.0):
 if __name__ == "__main__":
     res = [ffn_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(M, w) for M in (4680, 3120) for w in (None, 8)]
-    res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True), rope_kv_case(), kv_advance_case()]
+    res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True), rope_kv_case(), kv_advance_case(),
+            attn_window_case()]
     res.append(cycle_case())
     emit({"test": "vm_all", "pass": all(res), "n": len(res)})
     sys.exit(0 if all(res) else 1)
