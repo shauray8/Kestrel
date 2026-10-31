@@ -438,6 +438,9 @@ for tag, n1, calib, n2 in RUNS:
                                                  "p95": round(1e3 * lat[int(0.95 * len(lat))], 1), "max": round(1e3 * lat[-1], 1)},
                           "fps_e2e": round(4 * TAE_STATS["n"] / (tp[k - 1] - ts[0]), 2)}), flush=True)
     print(json.dumps({"exp": "n1_e2e", "tag": tag, "generate_s": round(t1 - t0, 2), "out": out}), flush=True)
+    if CAM.get("mods"):
+        PATHS["cam_cache_hits"] = CAM["hits"]
+        PATHS["cam_cache_misses"] = CAM["miss"]
     print(json.dumps({"exp": "paths", "tag": tag, **dict(sorted(PATHS.items()))}), flush=True)
     PATHS.clear()
     if GR:
