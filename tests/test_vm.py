@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from kestrel import ops, vm
 
-n1, fm, ext = ops.n1(), ops.fused_mod(), ops.vm()
+n1, fm, ext, rope = ops.n1(), ops.fused_mod(), ops.vm(), ops.rope_kv()
 if "--build-only" in sys.argv:
     sys.exit(0)
 E4, BF, D, FF, FRAME, TARGET, EPS = torch.float8_e4m3fn, torch.bfloat16, 1536, 8960, 1560, 16.0, 1e-6
@@ -127,6 +127,53 @@ def glue_case(M, window, seed=1, bcast=False, rebind=False):
     emit(r)
     return r["pass"]
 
+def rope_kv_case(L=257, H=12, HD=128, C=800, offset=137):
+    g = torch.Generator(device="cuda").manual_seed(4)
+    q, k, v = (torch.randn(1, L, H, HD, device="cuda", dtype=BF, generator=g) for _ in range(3))
+    pos = torch.arange(L, device="cuda", dtype=torch.float32)
+    inv = 1.0 / (10000 ** (torch.arange(HD // 2, device="cuda", dtype=torch.float32) / (HD // 2)))
+    theta = pos[:, None] * inv[None, :]
+    cos, sin = theta.cos()[:, None].contiguous(), theta.sin()[:, None].contiguous()
+    cs = torch.stack((cos[:, 0], sin[:, 0]), -1).flatten(1).contiguous()
+    kc0 = torch.randn(1, C, H, HD, device="cuda", dtype=BF, generator=g)
+    vc0 = torch.randn(1, C, H, HD, device="cuda", dtype=BF, generator=g)
+    kc_ref, vc_ref, kc_vm, vc_vm = kc0.clone(), vc0.clone(), kc0.clone(), vc0.clone()
+    qr = rope.rope_qk_append(q, k, v, cos, sin, kc_ref, vc_ref, offset)
+    qv = q.clone().view(L, H * HD)
+    p = vm.Program()
+    ids = [p.tensor(t) for t in (qv, k.view(L, H * HD), v.view(L, H * HD), cs,
+                                  kc_vm.view(C, H * HD), vc_vm.view(C, H * HD))]
+    p.rope_kv_append(*ids, offset)
+    p.build()
+    p.run()
+    torch.cuda.synchronize()
+    st = p.status()
+    r = {"test": "vm_rope_kv_append", "L": L, "offset": offset, **st, "q_mismatch_vs_rope_kv": diff(qv.view_as(qr), qr),
+         "k_mismatch_vs_rope_kv": diff(kc_vm, kc_ref), "v_mismatch_vs_rope_kv": diff(vc_vm, vc_ref)}
+    r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["q_mismatch_vs_rope_kv"] == 0 \
+        and r["k_mismatch_vs_rope_kv"] == 0 and r["v_mismatch_vs_rope_kv"] == 0
+    emit(r)
+    return r["pass"]
+
+def kv_advance_case(rows=400, width=1536, sink=32, drop=32):
+    g = torch.Generator(device="cuda").manual_seed(5)
+    k, v = (torch.randn(rows, width, device="cuda", dtype=BF, generator=g) for _ in range(2))
+    kr, vr = k.clone(), v.clone()
+    kr[sink:rows - drop] = kr[sink + drop:rows].clone()
+    vr[sink:rows - drop] = vr[sink + drop:rows].clone()
+    p = vm.Program()
+    ki, vi = p.tensor(k), p.tensor(v)
+    p.kv_advance(ki, vi, sink, drop, rows)
+    p.build()
+    p.run()
+    torch.cuda.synchronize()
+    st = p.status()
+    r = {"test": "vm_kv_advance", "rows": rows, "sink": sink, "drop": drop, **st,
+         "k_mismatch": diff(k, kr), "v_mismatch": diff(v, vr)}
+    r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["k_mismatch"] == 0 and r["v_mismatch"] == 0
+    emit(r)
+    return r["pass"]
+
 def cycle_case(M=3120, timeout_ms=50.0):
     g = torch.Generator(device="cuda").manual_seed(2)
     W = weights(g)
@@ -152,7 +199,7 @@ def cycle_case(M=3120, timeout_ms=50.0):
 if __name__ == "__main__":
     res = [ffn_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(M, w) for M in (4680, 3120) for w in (None, 8)]
-    res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True)]
+    res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True), rope_kv_case(), kv_advance_case()]
     res.append(cycle_case())
     emit({"test": "vm_all", "pass": all(res), "n": len(res)})
     sys.exit(0 if all(res) else 1)

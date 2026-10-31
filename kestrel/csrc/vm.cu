@@ -9,7 +9,7 @@
 namespace {
 constexpr int BM = 128, BN = 128, BK = 64, STAGES = 3, THREADS = 256, WN = 4, TM = 64, TN = 32, MI = 4, NJ = 4;
 constexpr int A_BYTES = BM * BK, B_BYTES = BN * BK, SMEM = STAGES * (A_BYTES + B_BYTES), RB = THREADS / 32, JQ = 32;
-enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, NOP };
+enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, NOP };
 enum : int { E_PLAIN, E_GELU, E_RES };
 enum : int { DT_F8, DT_BF16, DT_F32 };
 enum : int { ERR_TIMEOUT = 1, ERR_OPCODE = 2, ERR_OVERFLOW = 3 };
@@ -38,6 +38,17 @@ __device__ __forceinline__ float gelu(float x) { return 0.5f * x * (1.f + tanhf(
 __device__ __forceinline__ uint16_t q2(float a, float b, float inv) {
   __nv_fp8x2_e4m3 q(make_float2(a * inv, b * inv));
   return q.__x;
+}
+__device__ __forceinline__ void rotate8(uint4 raw, const float *cs, uint4 &out) {
+  const __nv_bfloat162 *in = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+  __nv_bfloat162 *dst = reinterpret_cast<__nv_bfloat162 *>(&out);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 x = __bfloat1622float2(in[j]);
+    const float c = __ldg(cs + 2 * j), s = __ldg(cs + 2 * j + 1);
+    dst[j] = __floats2bfloat162_rn(__fsub_rn(__fmul_rn(x.x, c), __fmul_rn(x.y, s)),
+                                   __fadd_rn(__fmul_rn(x.x, s), __fmul_rn(x.y, c)));
+  }
 }
 __device__ __forceinline__ int ld_acq(const int *p) {
   int v;
@@ -294,6 +305,45 @@ __device__ __forceinline__ bool op_rows_c(const Instr &I, const Tens *T) {
   }
 }
 
+__device__ __forceinline__ bool op_kv_advance(const Instr &I, const Tens *T) {
+  const Tens K = T[0], V = T[1];
+  const int rows = (int)I.eps;
+  if (rows <= 0 || K.dtype != DT_BF16 || V.dtype != DT_BF16 || K.rows != V.rows || K.cols != V.cols || K.cols % 8 ||
+      K.stride % 8 || V.stride % 8 || I.m < 0 || I.n <= I.m || I.n + rows > K.rows) return false;
+  const int vecs = K.cols / 8;
+  for (int i = threadIdx.x; i < rows * vecs; i += THREADS) {
+    const int row = i / vecs, lane = i - row * vecs;
+    reinterpret_cast<uint4 *>((__nv_bfloat16 *)K.p + (int64_t)(I.m + row) * K.stride)[lane] =
+        reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)K.p + (int64_t)(I.n + row) * K.stride)[lane];
+    reinterpret_cast<uint4 *>((__nv_bfloat16 *)V.p + (int64_t)(I.m + row) * V.stride)[lane] =
+        reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)V.p + (int64_t)(I.n + row) * V.stride)[lane];
+  }
+  return true;
+}
+
+__device__ __forceinline__ bool op_rope_kv_append(const Instr &I, const Tens *T) {
+  const Tens Q = T[0], K = T[1], V = T[2], CS = T[3], KC = T[4], VC = T[5];
+  const int base = I.m * BM, rows = min(BM, Q.rows - base), vecs = Q.cols / 8, dvec = CS.cols / 8;
+  if (rows <= 0 || Q.dtype != DT_BF16 || K.dtype != DT_BF16 || V.dtype != DT_BF16 || CS.dtype != DT_F32 ||
+      KC.dtype != DT_BF16 || VC.dtype != DT_BF16 || Q.rows != K.rows || Q.rows != V.rows || Q.cols != K.cols ||
+      Q.cols != V.cols || KC.cols != Q.cols || VC.cols != Q.cols || CS.rows != Q.rows || CS.cols <= 0 || CS.cols % 8 ||
+      Q.cols % CS.cols || Q.stride % 8 || K.stride % 8 || V.stride % 8 || KC.stride % 8 || VC.stride % 8 ||
+      I.n < 0 || I.n + Q.rows > KC.rows || VC.rows != KC.rows) return false;
+  for (int i = threadIdx.x; i < rows * vecs; i += THREADS) {
+    const int token = i / vecs, lane = i - token * vecs, g = base + token, pair = (lane % dvec) * 4;
+    uint4 qv, kv;
+    rotate8(reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)Q.p + (int64_t)g * Q.stride)[lane],
+            (const float *)CS.p + (int64_t)g * CS.stride + pair * 2, qv);
+    rotate8(reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)K.p + (int64_t)g * K.stride)[lane],
+            (const float *)CS.p + (int64_t)g * CS.stride + pair * 2, kv);
+    reinterpret_cast<uint4 *>((__nv_bfloat16 *)Q.p + (int64_t)g * Q.stride)[lane] = qv;
+    reinterpret_cast<uint4 *>((__nv_bfloat16 *)KC.p + (int64_t)(I.n + g) * KC.stride)[lane] = kv;
+    reinterpret_cast<uint4 *>((__nv_bfloat16 *)VC.p + (int64_t)(I.n + g) * VC.stride)[lane] =
+        reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)V.p + (int64_t)g * V.stride)[lane];
+  }
+  return true;
+}
+
 __device__ __forceinline__ bool exec(const Instr &I, const Tens *T, uint8_t *smem) {
   switch (I.op) {
     case OP_HALT: return true;
@@ -302,6 +352,8 @@ __device__ __forceinline__ bool exec(const Instr &I, const Tens *T, uint8_t *sme
     case OP_MOD_NORM: return op_rows_c<false>(I, T);
     case OP_RESIDUAL_MOD_NORM: return op_rows_c<true>(I, T);
     case OP_GEMM_F8_GATED_RES: op_gemm<E_RES>(I, T, smem); return true;
+    case OP_ROPE_KV_APPEND: return op_rope_kv_append(I, T);
+    case OP_KV_ADVANCE: return op_kv_advance(I, T);
     default: return false;
   }
 }

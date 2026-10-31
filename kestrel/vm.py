@@ -5,8 +5,8 @@ import torch
 
 from kestrel import ops
 
-HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN = range(7)
-OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join")
+HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE = range(9)
+OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance")
 ERRORS = ("ok", "timeout", "opcode", "overflow")
 BM, BN, RB, MAXT = 128, 128, 8, 16
 _DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2}
@@ -84,6 +84,26 @@ class Program:
             assert i < 0 or (self.shapes[i][1] == C and M % self.shapes[i][0] == 0 and self.shapes[i][2] == torch.float32)
         return self._stage(lambda: [self.add(op, m, 0, (x, y, gate, shift, scale, out), eps, after(m) if after else ())
                                     for m in range(_cdiv(M, RB))])
+
+    def rope_kv_append(self, q, k, v, cs, kc, vc, write_offset, after=None):
+        L, C, dq = self.shapes[q]
+        assert dq == self.shapes[k][2] == self.shapes[v][2] == self.shapes[kc][2] == self.shapes[vc][2] == torch.bfloat16
+        assert self.shapes[k] == self.shapes[v] == (L, C, dq)
+        assert self.shapes[cs][0] == L and self.shapes[cs][2] == torch.float32 and C % self.shapes[cs][1] == 0 and C % 8 == 0
+        assert self.shapes[kc] == self.shapes[vc] and self.shapes[kc][1] == C and 0 <= write_offset <= self.shapes[kc][0] - L
+        return self._stage(lambda: [self.add(ROPE_KV_APPEND, m, write_offset, (q, k, v, cs, kc, vc),
+                                                   after=after(m) if after else ()) for m in range(_cdiv(L, BM))])
+
+    def kv_advance(self, k, v, sink, drop, used):
+        assert self.shapes[k] == self.shapes[v] and self.shapes[k][2] == torch.bfloat16 and self.shapes[k][1] % 8 == 0
+        assert 0 <= sink < used <= self.shapes[k][0] and drop > 0 and sink % 16 == drop % 16 == used % 16 == 0
+        count = used - sink - drop
+        tiles = [self.add(KV_ADVANCE, sink + i, sink + drop + i, (k, v), min(16, count - i))
+                 for i in range(0, count, 16)]
+        stride = drop // 16
+        for i in range(len(tiles) - stride):
+            self.edge(tiles[i], tiles[i + stride])
+        return tiles
 
     def window(self, tiles, w):
         for m in range(w or len(tiles), len(tiles)):
