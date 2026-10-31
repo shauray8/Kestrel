@@ -344,7 +344,12 @@ if os.environ.get("ROPE32") == "1":
 
 if os.environ.get("ROPE_KV") == "1":
     from ropekv_hook import install as ropekv_install
-    ropekv_install(mf, ops)
+    if os.environ.get("VM_ATTN") == "1":
+        assert ATTN_IMPL == "n2", "VM_ATTN=1 requires ATTN=n2"
+        from kestrel import vm as vm_runtime
+        ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"))
+    else:
+        ropekv_install(mf, ops)
 if os.environ.get("XATTN") == "1":
     from xattn import install as xattn_install
     xattn_install(mf)
@@ -381,7 +386,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "XATTN")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "XATTN")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):
