@@ -206,7 +206,7 @@ def test_history_reuse_epoch_and_boundary(monkeypatch):
     trace.calls.clear()
     out = fa(0, q[None], k[None], v[None])
     assert fa.stats["hist_quant"] == 2
-    assert sum(call[1:3] == (0, 2) for call in trace.calls) == 2
+    assert sum(call[1:3] == (0, 2) for call in trace.calls if call[0] in (k.data_ptr(), v.data_ptr())) == 2
     fresh = FAttention(mode="fp8", load_mode=0, exp_mode=0, rescale_threshold=0)(0, q[None], k[None], v[None])
     assert torch.equal(out, fresh)
     fa(1, q[None], k[None], v[None])

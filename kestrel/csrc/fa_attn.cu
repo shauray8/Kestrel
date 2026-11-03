@@ -241,7 +241,7 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
     const float al0 = ex2(m0 - mx0), al1 = ex2(m1 - mx1);
     m0 = mx0; m1 = mx1;
     uint32_t p0[8], p1[8];
-    if constexpr (Exp == 2) {
+    if (Exp == 2 && sk >= 6.2e-5f) {
       const __half2 skh = __float2half2_rn(sk), c0 = __float2half2_rn(8.f - mx0), c1 = __float2half2_rn(8.f - mx1);
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
