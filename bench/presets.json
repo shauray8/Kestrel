@@ -83,7 +83,12 @@
       "ROPE32": "1",
       "ROPE_KV": "1",
       "XATTN": "1",
-      "ONLY": "n2_calib_rope32,n1n2_rope32"
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1",
+      "FA_LOAD_MODE": "3",
+      "FA_EXP_MODE": "0",
+      "FA_Q_TILE": "128",
+      "FA_RESCALE_THRESHOLD": "0.5"
     },
     "best_spec": {
       "FUSED_GLUE": "1",
