@@ -39,8 +39,8 @@ PYTHONPATH=. python tests/test_ffn_cluster.py --build-only
 PYTHONPATH=. python tests/test_ffn_cluster.py
 PYTHONPATH=. python bench/ffn_cluster_bench.py
 PYTHONPATH=. ncu --metrics lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum --kernel-name regex:ffn_kernel --launch-skip 3 --launch-count 1 python bench/ffn_cluster_bench.py --variant cluster --m 3120 --no-gated
-PYTHONPATH=. ncu --metrics lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum --launch-skip 6 --launch-count 2 python bench/ffn_cluster_bench.py --variant vm --m 3120 --no-gated
-PYTHONPATH=. ncu --metrics lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum --launch-skip 6 --launch-count 2 python bench/ffn_cluster_bench.py --variant n1 --m 3120 --no-gated
+PYTHONPATH=. ncu --metrics lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum --kernel-name 'regex:k_(reset|vm)' --launch-skip 6 --launch-count 2 python bench/ffn_cluster_bench.py --variant vm --m 3120 --no-gated
+PYTHONPATH=. ncu --metrics lts__t_bytes.sum,dram__bytes_read.sum,dram__bytes_write.sum --kernel-name regex:n1_f8 --launch-skip 6 --launch-count 2 python bench/ffn_cluster_bench.py --variant n1 --m 3120 --no-gated
 ```
 
 The test requires bitwise equality with the VM and n1 paths for plain and gated
