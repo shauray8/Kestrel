@@ -9,13 +9,26 @@ def install(g):
     assert os.environ.get("ROPE_KV") == "1" and os.environ.get("VM_ATTN") == "1" and os.environ.get("ATTN", "n2") == "n2"
     PATHS, MODE, TARGET, FusedFFN, fmod, orig, mf, pipe = (g[k] for k in
         ("PATHS", "MODE", "TARGET", "FusedFFN", "fmod", "_glue_block_forward", "_mf_glue", "pipe"))
-    programs, scratch = {}, {}
+    programs, scratch, norms = {}, {}, {}
 
     def lin_ok(l):
         return (MODE["n1"] and hasattr(l, "wq") and l.ok and l.amax > 0 and l.bias_bf16 is not None)
 
+    def norm3(blk):
+        n = blk.norm3
+        if isinstance(n, torch.nn.Identity):
+            return None
+        ent = norms.get(id(blk))
+        if ent is None:
+            C, dev = n.normalized_shape[0], blk.modulation.device
+            w = n.weight.detach().float().view(1, C) if n.weight is not None else torch.ones(1, C, device=dev)
+            b = n.bias.detach().float().view(1, C).contiguous() if n.bias is not None else torch.zeros_like(w)
+            ent = norms[id(blk)] = (b, (w - 1).contiguous(), n.eps)
+        return ent
+
     def ready(blk):
-        return (MODE["n2"] and isinstance(blk.ffn, FusedFFN) and isinstance(blk.norm3, torch.nn.Identity) and
+        return (MODE["n2"] and isinstance(blk.ffn, FusedFFN) and
+                (isinstance(blk.norm3, torch.nn.Identity) or isinstance(blk.norm3, torch.nn.LayerNorm)) and
                 all(lin_ok(l) for l in (blk.self_attn.q, blk.self_attn.k, blk.self_attn.v, blk.self_attn.o,
                                        blk.cross_attn.q, blk.cross_attn.k, blk.cross_attn.v, blk.cross_attn.o,
                                        blk.ffn.l0, blk.ffn.l2)))
@@ -64,18 +77,20 @@ def install(g):
         ent = programs.get(key)
         if ent is None:
             q = torch.empty(M, C, dtype=torch.bfloat16, device=x.device)
+            nm = norm3(blk)
             if first:
                 k, v = (torch.empty(L, C, dtype=torch.bfloat16, device=x.device) for _ in range(2))
                 p = vm.cross_qkv_program(x, context, a.q.amax / TARGET, a.k.amax / TARGET,
                                          a.q.wq, a.q.sw, a.q.bias_bf16, a.k.wq, a.k.sw, a.k.bias_bf16,
-                                         a.v.wq, a.v.sw, a.v.bias_bf16, q, k, v)
+                                         a.v.wq, a.v.sw, a.v.bias_bf16, q, k, v, nm)
             else:
                 k = v = None
-                p = vm.linear_program(x, a.q.amax / TARGET, a.q.wq, a.q.sw, a.q.bias_bf16, q)
+                p = vm.linear_program(x, a.q.amax / TARGET, a.q.wq, a.q.sw, a.q.bias_bf16, q, nm)
             p.checked = False
+            p.xname = ("q" if first else "") + ("residual" if nm is not None else "x")
             ent = programs[key] = (p, q, k, v)
         p, q, k, v = ent
-        p.bind("qx" if first else "x", x)
+        p.bind(p.xname, x)
         if first:
             p.bind("kx", context)
         run(p)

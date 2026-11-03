@@ -204,9 +204,9 @@ def _linear(p, tx, joins, w, sw, b, y, prefix=""):
     return p.gemm(tx, p.tensor(w, vscale=sw, name=prefix + "w"), p.tensor(y, name=prefix + "y"),
                   p.tensor(b.view(1, -1), name=prefix + "b"), after=lambda m, n: [joins[m]])
 
-def linear_program(x, sa, w, sw, b, y):
+def linear_program(x, sa, w, sw, b, y, norm=None):
     p = Program()
-    tx, joins = _quantized(p, x, sa)
+    tx, joins = _normed(p, x, sa, "", norm)
     _linear(p, tx, joins, w, sw, b, y)
     return p.build()
 
@@ -221,9 +221,18 @@ def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv
     _linear(p, tx, joins, wv, swv, bv, v, "v")
     return p.build()
 
-def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v):
+def _normed(p, x, sa, prefix="", norm=None):
+    if norm is None:
+        return _quantized(p, x, sa, prefix)
+    shift, scale, eps = norm
+    y = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    rows = p.rows(MOD_NORM, p.tensor(x, name=prefix + "residual"), shift=p.tensor(shift, name=prefix + "shift"),
+                  scale=p.tensor(scale, name=prefix + "scale"), out=p.tensor(y, name=prefix + "norm"), eps=eps)
+    return _quantized(p, y, sa, prefix, after=lambda m: [rows[m]])
+
+def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, norm=None):
     p = Program()
-    tx, qjoins = _quantized(p, x, sa, "q")
+    tx, qjoins = _normed(p, x, sa, "q", norm)
     tk, kjoins = _quantized(p, context, ska, "k")
     _linear(p, tx, qjoins, wq, swq, bq, q, "q")
     _linear(p, tk, kjoins, wk, swk, bk, k, "k")

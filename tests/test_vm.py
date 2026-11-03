@@ -250,9 +250,9 @@ def block_ops_case(M=3120, L=512):
     qr4 = rope.rope_qk_append(qr4, kr4, v4, cos, sin, kcr.view(1, offset + M, H, 128), vcr.view(1, offset + M, H, 128), offset)
     ar4 = n2.n2_attention(qr4.half(), kcr[:offset + M].view(1, offset + M, H, 128).half(),
                           vcr[:offset + M].view(1, offset + M, H, 128).half()).to(BF)
-    ps, sa4 = vm.self_attention_program(q4, k4, v4, cs, kcv, vcv, 0, offset + M, offset, None, nq, nk, EPS)
+    ps, sa4 = vm.self_attention_program(outs[0], outs[1], outs[2], cs, kcv, vcv, 0, offset + M, offset, None, nq, nk, EPS)
     ps.run(); torch.cuda.synchronize()
-    self_rel = rel(sa4, ar4)
+    self_rel = rel(sa4, ar4.view(M, D))
     statuses = [p.status(), po.status(), pc.status(), pa.status(), ps.status()]
     r = {"test": "vm_block_ops", "M": M, "L": L, **st, "qkv_mismatch": qkv_diff, "cross_qkv_mismatch": cross_diff,
          "residual_mismatch": residual_diff, "cross_attn_mismatch": attn_diff, "cross_attn_rel": attn_rel, "self_attn_rel": self_rel}
