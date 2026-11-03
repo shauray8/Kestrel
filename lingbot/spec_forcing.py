@@ -1,4 +1,5 @@
 import inspect, json, os
+from functools import wraps
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -134,6 +135,7 @@ def install(pipe):
     model, inner, gen = pipe.model, pipe.model.forward, pipe.generate
     K0 = inspect.signature(gen).parameters["timesteps_index"].default
     mf.CausalWanSelfAttention.forward = _sa_forward
+    pipe._kv_reuse_commit = lambda xt: S["hist"].append(xt.float())
     S = {"tau": [float(os.environ[k]) if k in os.environ else None for k in ("SPEC_TAU_RED", "SPEC_TAU_STAB")],
          "wrapped": False}
 
@@ -206,6 +208,7 @@ def install(pipe):
         S["prev"] = draft
         return [pred]
 
+    @wraps(gen)
     def generate(*a, **kw):
         if not S["wrapped"]:
             for blk in model.blocks:

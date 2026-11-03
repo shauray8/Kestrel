@@ -304,7 +304,8 @@ if os.environ.get("TAE_LIVE") == "1":
             TAE_STATS["n"] += x0.shape[1]; TAE_STATS["ms"] += 1e3 * (time.perf_counter() - t0)
         return _orig_fwd(*a, **kw)
 
-    pipe.model.forward = _fwd_with_decode
+    if os.environ.get("KV_REUSE") != "1":
+        pipe.model.forward = _fwd_with_decode
 
 mf.attention = n2_attention
 
@@ -363,6 +364,13 @@ if os.environ.get("GRAPHS"):
     from graphs import Graphs
     GR = Graphs(pipe.model, lambda: not MODE["calib"])
 
+if os.environ.get("KV_REUSE") == "1":
+    from kv_reuse import install as kv_reuse_install
+    kv_reuse_install(pipe, PATHS)
+    if os.environ.get("TAE_LIVE") == "1":
+        _orig_fwd = pipe.model.forward
+        pipe.model.forward = _fwd_with_decode
+
 os.makedirs(OUT, exist_ok=True)
 prompt = open(f"{EXAMPLE}/prompt.txt").read().strip()
 img = Image.open(f"{EXAMPLE}/image.jpg").convert("RGB")
@@ -390,7 +398,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "KV_REUSE", "KV_REUSE_MODE")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):
