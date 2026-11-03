@@ -452,7 +452,7 @@ CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
     _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE", "GLUE2")
     if ATTN_IMPL == "fa":
-        _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE", "FA_MX")
+        _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE", "FA_MX", "FA_BAL")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):

@@ -7,13 +7,14 @@ def _src(x):
 
 
 class FAttention:
-    def __init__(self, mode=None, load_mode=None, exp_mode=None, rescale_threshold=None, q_tile=None, mx=None):
+    def __init__(self, mode=None, load_mode=None, exp_mode=None, rescale_threshold=None, q_tile=None, mx=None, bal=None):
         self.mode = (mode if mode is not None else os.environ.get("FA_MODE", "fp8")).lower()
         self.load_mode = int(load_mode if load_mode is not None else os.environ.get("FA_LOAD_MODE", "0"))
         self.exp_mode = int(exp_mode if exp_mode is not None else os.environ.get("FA_EXP_MODE", "0"))
         self.rescale_threshold = float(rescale_threshold if rescale_threshold is not None else os.environ.get("FA_RESCALE_THRESHOLD", "0"))
         self.q_tile = int(q_tile if q_tile is not None else os.environ.get("FA_Q_TILE", "128"))
         self.mx = bool(int(mx if mx is not None else os.environ.get("FA_MX", "0")))
+        self.bal = bool(int(bal if bal is not None else os.environ.get("FA_BAL", "0")))
         if self.mode not in ("fp8", "fp16"):
             raise ValueError("FA_MODE must be fp8 or fp16")
         if self.load_mode not in (0, 1, 3):
@@ -26,6 +27,8 @@ class FAttention:
             raise ValueError("FA_Q_TILE must be 64 or 128")
         if self.mx and self.load_mode != 3:
             raise ValueError("FA_MX=1 requires FA_LOAD_MODE=3")
+        if self.bal and (self.load_mode != 3 or self.q_tile != 128):
+            raise ValueError("FA_BAL=1 requires FA_LOAD_MODE=3 and FA_Q_TILE=128")
         self.epoch = 0
         self.state = {}
         self.stats = {"hist_quant": 0, "calls": 0}
@@ -73,5 +76,5 @@ class FAttention:
         ext = ops.fa()
         ext.fa_quant(_src(q[0]), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 8)
         out = ext.fa_attention(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"], q.shape[1], k.shape[1],
-                               q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold, st.get("plan"), self.q_tile, self.mx)
+                               q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold, st.get("plan"), self.q_tile, self.mx, self.bal)
         return out[None].to(q.dtype)

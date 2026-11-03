@@ -192,6 +192,35 @@ def test_mx_pv(exp_mode, tile, lq, lk):
     print(json.dumps({"kind": "fa_mx", "lq": lq, "lk": lk, "tile": tile, "exp_mode": exp_mode, "rel_mx": err_mx, "rel_base": err_base}), flush=True)
     assert torch.isfinite(mx).all() and err_mx <= err_base * 1.05 + 1e-3
 
+@pytest.mark.parametrize("exp_mode", (0, 1, 2))
+@pytest.mark.parametrize("mx", (False, True))
+@pytest.mark.parametrize("lq,lk,h", ((3120, 3120, 12), (3120, 3133, 12), (3120, 9360, 12), (129, 385, 2)))
+def test_bal(exp_mode, mx, lq, lk, h):
+    ext = ops.fa()
+    q, k, v = tensors(lq, lk, h)
+    (q8, qs), (k8, ks), (v8, vs) = pack(ext, q), pack(ext, k), pack(ext, v, True, 1)
+    if mx:
+        vm8, vms = torch.empty_like(v8), torch.empty_like(vs)
+        ext.fa_quant(v, vm8, vms, 0, vms.shape[1], True, 448, True)
+        v8, vs = vm8, vms
+    plan = ext.fa_plan(k8, v8)
+    out_bal = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, mx, True)
+    out_base = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, mx, False)
+    assert torch.isfinite(out_bal).all() and torch.isfinite(out_base).all()
+    parity = relative(out_bal, out_base)
+    identical = float((out_bal == out_base).reshape(lq, -1).all(dim=1).float().mean())
+    assert parity < 1e-3
+    if (lq + 127) // 128 * h < 170:
+        assert torch.equal(out_bal, out_base)
+    else:
+        assert identical > 0.5
+    integrated = FAttention(mode="fp8", load_mode=3, exp_mode=exp_mode, rescale_threshold=0.5, q_tile=128, mx=mx, bal=True)
+    assert torch.equal(out_bal, integrated(0, q[None], k[None], v[None])[0])
+    ref = reference(q, k, v)
+    print(json.dumps({"kind": "fa_bal", "lq": lq, "lk": lk, "h": h, "exp_mode": exp_mode, "mx": mx,
+                      "rel_bal_base": parity, "identical_rows": identical, "rel_bal_fp32": relative(out_bal, ref),
+                      "rel_base_fp32": relative(out_base, ref)}), flush=True)
+
 @pytest.mark.parametrize("mode", MODES)
 def test_nondefault_stream(mode):
     ops.fa()
