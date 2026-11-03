@@ -28,3 +28,6 @@ def rope_kv():
 
 def vm():
     return _ext("vm")
+
+def ffn_cluster():
+    return _ext("ffn_cluster")
