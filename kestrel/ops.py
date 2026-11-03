@@ -20,6 +20,9 @@ def n3():
 def n2():
     return _ext("n2_attn")
 
+def fa():
+    return _ext("fa_attn")
+
 def nvfp4():
     return _ext("nvfp4_quant")
 

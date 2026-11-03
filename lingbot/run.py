@@ -241,22 +241,26 @@ if os.environ.get("VM_FFN") == "1" or os.environ.get("VM_BLOCK") == "1":
 ATTN_IMPL = os.environ.get("ATTN", "n2")
 if ATTN_IMPL in ("sage2", "kvq"):
     from sageattention import sageattn
-KVQ = None
+KVQ = FA = None
 if ATTN_IMPL == "kvq":
     from kestrel.kvq import KVQAttention
     KVQ = KVQAttention()
-    KVQ_STATE = {"layer": 0, "start": None}
+if ATTN_IMPL == "fa":
+    from kestrel.fa import FAttention
+    FA = FAttention()
+if ATTN_IMPL in ("kvq", "fa"):
+    ATTN_STATE = {"layer": 0, "start": None}
     _orig_model_fwd = pipe.model.forward
 
-    def _kvq_model_fwd(*a, **kw):
+    def _cached_attn_model_fwd(*a, **kw):
         cs = kw.get("current_start")
-        if cs != KVQ_STATE["start"]:
-            KVQ_STATE["start"] = cs
-            KVQ.new_epoch()
-        KVQ_STATE["layer"] = 0
+        if cs != ATTN_STATE["start"]:
+            ATTN_STATE["start"] = cs
+            (KVQ if KVQ is not None else FA).new_epoch()
+        ATTN_STATE["layer"] = 0
         return _orig_model_fwd(*a, **kw)
 
-    pipe.model.forward = _kvq_model_fwd
+    pipe.model.forward = _cached_attn_model_fwd
 
 import wan.modules.model_fast as mf
 ext2 = ops.n2()
@@ -266,9 +270,13 @@ def n2_attention(q, k, v, *a, **kw):
     if not MODE.get("n2") or ATTN_IMPL == "sdpa" or q.shape[0] != 1 or q.shape[-1] != 128 or a or kw:
         PATHS["attn_stock_" + ("off" if not MODE.get("n2") else "args" if a or kw else "sdpa" if ATTN_IMPL == "sdpa" else "shape")] += 1
         return _orig_attention(q, k, v, *a, **kw)
+    if ATTN_IMPL == "fa" and q.ndim == 4 and k.shape == v.shape and k.shape[0] == 1 and q.shape[2:] == k.shape[2:] and k.shape[1] >= q.shape[1]:
+        PATHS["attn_fa"] += 1
+        layer = ATTN_STATE["layer"]; ATTN_STATE["layer"] += 1
+        return FA(layer, q, k, v)
     if ATTN_IMPL == "kvq" and k.shape[1] > q.shape[1]:
         PATHS["attn_kvq"] += 1
-        layer = KVQ_STATE["layer"]; KVQ_STATE["layer"] += 1
+        layer = ATTN_STATE["layer"]; ATTN_STATE["layer"] += 1
         return KVQ(layer, q, k, v).to(q.dtype)
     if ATTN_IMPL in ("sage2", "kvq"):
         PATHS["attn_sage2"] += 1
@@ -397,6 +405,8 @@ def after_calib():
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
     _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN")
+    if ATTN_IMPL == "fa":
+        _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):
@@ -408,6 +418,9 @@ if os.environ.get("CALIB_CACHE"):
         print(json.dumps({"exp": "calib_cache", "hit": True, "key": _key}), flush=True)
 for tag, n1, calib, n2 in RUNS:
     MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
+    if FA is not None:
+        FA.new_epoch()
+        ATTN_STATE.update(layer=0, start=None)
     for m in CAM.get("mods", []):
         m.key, m.val = None, None
     CAM.update(hits=0, miss=0)
