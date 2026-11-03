@@ -193,9 +193,10 @@ def self_attention_program(q, k, v, cs, kc, vc, lo, hi, write_offset, advance=No
     out = p.self_attention(q, k, v, cs, kc, vc, lo, hi, write_offset, advance, norm_q, norm_k, eps)
     return p.build(), out
 
-def _quantized(p, x, sa, prefix="", after=None):
+def _quantized(p, x, sa, prefix="", after=None, xi=None):
     x8 = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
-    xi, ti = p.tensor(x, name=prefix + "x"), p.tensor(x8, sa, name=prefix + "x8")
+    xi = p.tensor(x, name=prefix + "x") if xi is None else xi
+    ti = p.tensor(x8, sa, name=prefix + "x8")
     qt = p.quantize(xi, ti, after=after)
     joins = [p.join(qt[m * BM // RB:(m + 1) * BM // RB]) for m in range(_cdiv(x.size(0), BM))]
     return ti, joins
@@ -213,9 +214,10 @@ def linear_program(x, sa, w, sw, b, y, norm=None):
 def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v):
     p = Program()
     norm = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    ni = p.tensor(norm, name="norm")
     mod = p.rows(MOD_NORM, p.tensor(x, name="residual"), shift=p.tensor(shift, name="shift"),
-                 scale=p.tensor(scale, name="scale"), out=p.tensor(norm, name="norm"), eps=eps)
-    tx, joins = _quantized(p, norm, sa, after=lambda m: [mod[m]])
+                 scale=p.tensor(scale, name="scale"), out=ni, eps=eps)
+    tx, joins = _quantized(p, norm, sa, after=lambda m: [mod[m]], xi=ni)
     _linear(p, tx, joins, wq, swq, bq, q, "q")
     _linear(p, tx, joins, wk, swk, bk, k, "k")
     _linear(p, tx, joins, wv, swv, bv, v, "v")
@@ -226,9 +228,10 @@ def _normed(p, x, sa, prefix="", norm=None):
         return _quantized(p, x, sa, prefix)
     shift, scale, eps = norm
     y = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    yi = p.tensor(y, name=prefix + "norm")
     rows = p.rows(MOD_NORM, p.tensor(x, name=prefix + "residual"), shift=p.tensor(shift, name=prefix + "shift"),
-                  scale=p.tensor(scale, name=prefix + "scale"), out=p.tensor(y, name=prefix + "norm"), eps=eps)
-    return _quantized(p, y, sa, prefix, after=lambda m: [rows[m]])
+                  scale=p.tensor(scale, name=prefix + "scale"), out=yi, eps=eps)
+    return _quantized(p, y, sa, prefix, after=lambda m: [rows[m]], xi=yi)
 
 def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, norm=None):
     p = Program()

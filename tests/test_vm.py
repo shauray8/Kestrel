@@ -226,7 +226,7 @@ def block_ops_case(M=3120, L=512):
     kc, vc = (torch.empty(L, D, dtype=BF, device="cuda") for _ in range(2))
     pc = vm.cross_qkv_program(x, context, sa, sa, *W[0], *W[1], *W[2], qc, kc, vc)
     pc.run(); torch.cuda.synchronize()
-    cross_diff = diff(qc, refs[0]) + sum(diff(a, n1.n1_linear(context, w[0], w[1], w[2], sa)) for a, w in zip((kc, vc), W[1:3]))
+    cross_diff = diff(qc, n1.n1_linear(x.to(BF), *W[0], sa)) + sum(diff(a, n1.n1_linear(context, w[0], w[1], w[2], sa)) for a, w in zip((kc, vc), W[1:3]))
     nq, nk = (torch.randn(1, D, device="cuda", dtype=BF, generator=g) for _ in range(2))
     pa, ca = vm.cross_attention_program(qc, kc, vc, nq, nk, EPS)
     def rms(a, w):
