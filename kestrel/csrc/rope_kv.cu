@@ -20,7 +20,8 @@ __device__ __forceinline__ void rotate8(uint4 raw, const float *cos, const float
 __global__ void rope_qk_append_kernel(const uint4 *__restrict__ q, const uint4 *__restrict__ k, const uint4 *__restrict__ v,
                                       const float *__restrict__ cos, const float *__restrict__ sin, uint4 *__restrict__ q_out,
                                       uint4 *__restrict__ k_cache, uint4 *__restrict__ v_cache, int64_t vectors_per_batch,
-                                      int64_t cache_token_stride, int heads, int dim, int64_t write_offset) {
+                                      int64_t cache_token_stride, int heads, int dim, int64_t write_offset,
+                                      const int64_t *indices, const int64_t *count) {
   const int64_t within = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (within >= vectors_per_batch) return;
   const int64_t b = blockIdx.y;
@@ -29,14 +30,17 @@ __global__ void rope_qk_append_kernel(const uint4 *__restrict__ q, const uint4 *
   const int64_t token = within / vec_per_token;
   const int lane = (int)(within - token * vec_per_token);
   const int pair = (lane % (dim >> 3)) * 4;
-  const int64_t table = token * (dim >> 1) + pair;
+  const int64_t position = indices ? indices[token] : token;
+  const int64_t table = position * (dim >> 1) + pair;
   uint4 qv, kv;
   rotate8(q[i], cos + table, sin + table, qv);
   rotate8(k[i], cos + table, sin + table, kv);
   q_out[i] = qv;
-  const int64_t dst = b * cache_token_stride + ((write_offset + token) * heads * dim >> 3) + lane;
-  k_cache[dst] = kv;
-  v_cache[dst] = v[i];
+  if (!count || token < *count) {
+    const int64_t dst = b * cache_token_stride + ((write_offset + position) * heads * dim >> 3) + lane;
+    k_cache[dst] = kv;
+    v_cache[dst] = v[i];
+  }
 }
 void check_nhd(const torch::Tensor &x, const char *name) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.is_contiguous() && x.dim() == 4,
@@ -47,8 +51,9 @@ void check_nhd(const torch::Tensor &x, const char *name) {
 
 }
 
-torch::Tensor rope_qk_append(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor cos, torch::Tensor sin,
-                             torch::Tensor k_cache, torch::Tensor v_cache, int64_t write_offset) {
+torch::Tensor rope_qk_append_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor cos, torch::Tensor sin,
+                                  torch::Tensor k_cache, torch::Tensor v_cache, int64_t write_offset,
+                                  torch::Tensor indices, torch::Tensor count) {
   check_nhd(q, "q");
   check_nhd(k, "k");
   check_nhd(v, "v");
@@ -58,11 +63,18 @@ torch::Tensor rope_qk_append(torch::Tensor q, torch::Tensor k, torch::Tensor v, 
   TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "k_cache and v_cache must have identical shapes");
   TORCH_CHECK(k_cache.size(0) == q.size(0) && k_cache.size(2) == q.size(2) && k_cache.size(3) == q.size(3),
               "cache batch/head dimensions must match q");
-  TORCH_CHECK(write_offset >= 0 && write_offset + q.size(1) <= k_cache.size(1), "cache write range is out of bounds");
+  TORCH_CHECK(write_offset >= 0 && write_offset + (indices.defined() ? cos.size(0) : q.size(1)) <= k_cache.size(1),
+              "cache write range is out of bounds");
+  if (indices.defined()) {
+    TORCH_CHECK(indices.is_cuda() && indices.scalar_type() == torch::kInt64 && indices.is_contiguous() &&
+                    indices.dim() == 1 && indices.size(0) == q.size(1), "indices must be contiguous CUDA int64 [L]");
+    TORCH_CHECK(count.is_cuda() && count.scalar_type() == torch::kInt64 && count.numel() == 1,
+                "count must be CUDA int64 scalar");
+  }
   TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && cos.scalar_type() == torch::kFloat32 && sin.scalar_type() == torch::kFloat32,
               "cos and sin must be CUDA fp32");
   TORCH_CHECK(cos.is_contiguous() && sin.is_contiguous() && cos.sizes() == sin.sizes() && cos.dim() == 3 &&
-                  cos.size(0) == q.size(1) && cos.size(1) == 1 && cos.size(2) == q.size(3) / 2,
+                  (indices.defined() || cos.size(0) == q.size(1)) && cos.size(1) == 1 && cos.size(2) == q.size(3) / 2,
               "cos and sin must be contiguous [L,1,D/2]");
   auto out = torch::empty_like(q);
   const int64_t vec_per_batch = q.numel() / q.size(0) / 8;
@@ -73,12 +85,19 @@ torch::Tensor rope_qk_append(torch::Tensor q, torch::Tensor k, torch::Tensor v, 
       reinterpret_cast<const uint4 *>(v.data_ptr()), cos.data_ptr<float>(), sin.data_ptr<float>(),
       reinterpret_cast<uint4 *>(out.data_ptr()), reinterpret_cast<uint4 *>(k_cache.data_ptr()),
       reinterpret_cast<uint4 *>(v_cache.data_ptr()), vec_per_batch, k_cache.numel() / q.size(0) / 8, q.size(2), q.size(3),
-      write_offset);
+      write_offset, indices.defined() ? indices.data_ptr<int64_t>() : nullptr, count.defined() ? count.data_ptr<int64_t>() : nullptr);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+torch::Tensor rope_qk_append(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor cos, torch::Tensor sin,
+                             torch::Tensor k_cache, torch::Tensor v_cache, int64_t write_offset) {
+  return rope_qk_append_impl(q, k, v, cos, sin, k_cache, v_cache, write_offset, {}, {});
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope_qk_append", &rope_qk_append, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cos"), py::arg("sin"),
         py::arg("k_cache"), py::arg("v_cache"), py::arg("write_offset"));
+  m.def("rope_qk_scatter", &rope_qk_append_impl, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache"), py::arg("v_cache"), py::arg("write_offset"), py::arg("indices"), py::arg("count"));
 }

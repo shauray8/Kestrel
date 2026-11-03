@@ -4,6 +4,7 @@ import torch
 def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
     ext = ops.rope_kv()
     original = mf.CausalWanSelfAttention.forward
+    sparse = getattr(mf.CausalWanSelfAttention, "_spec_sparse", None)
     cache, programs = {}, {}
 
     def tables(x, grid_sizes, freqs, start_frame):
@@ -65,8 +66,11 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
         current_end = current_start + s
         sink_tokens = self.sink_size * frame_seqlen
         cache_size = kv_cache["k"].shape[1]
-        old_global = int(kv_cache["global_end_index"].item())
-        old_local = int(kv_cache["local_end_index"].item())
+        if "_spec_end" in kv_cache:
+            old_global, old_local = kv_cache["_spec_end"]
+        else:
+            old_global = int(kv_cache["global_end_index"].item())
+            old_local = int(kv_cache["local_end_index"].item())
         advance = None
         use_vm = vm is not None and enabled()
         if self.local_attn_size == -1:
@@ -99,10 +103,15 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             out = mf.attention(roped_query, kv_cache["k"][:, lo:local_end_index], kv_cache["v"][:, lo:local_end_index])
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
+        if "_spec_end" in kv_cache:
+            kv_cache["_spec_end"] = (current_end, local_end_index)
         return out
 
     def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
                 frame_seqlen=None, seq_lens_int=None):
+        if sparse is not None and sparse():
+            return original(self, x, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
+                            frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int)
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)

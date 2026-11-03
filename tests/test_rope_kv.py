@@ -1,6 +1,7 @@
 import json
 import sys
 import torch
+from lingbot.spec_compact import bucket_capacity, compact
 from kestrel import ops
 
 ext = ops.rope_kv()
@@ -84,6 +85,32 @@ def timing():
         print(json.dumps({"kind": "timing", "cache": "l2_flushed" if cold else "hot", "torch_us": ref_us,
                           "fused_us": fused_us, "speedup": ref_us / fused_us}), flush=True)
 
+def sparse_check():
+    cos, sin = tables(18)
+    for count in (0, 1, 128, 257, L - 8, L):
+        torch.manual_seed(2000 + count)
+        active = torch.zeros(L, dtype=torch.bool, device="cuda")
+        active[torch.randperm(L, device="cuda")[:count]] = True
+        capacity = bucket_capacity(count, L) or 128
+        idx, _, writes, _, _ = compact(active, capacity)
+        q, k, v = (torch.randn(B, capacity, H, D, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+        kc = torch.randn(B, C, H, D, device="cuda", dtype=torch.bfloat16)
+        vc = torch.randn_like(kc)
+        kr, vr = kc.clone(), vc.clone()
+        def rotate(x):
+            pair = x.float().unflatten(-1, (-1, 2))
+            a, b = pair[..., 0], pair[..., 1]
+            return torch.stack((a * cos[idx] - b * sin[idx], a * sin[idx] + b * cos[idx]), -1).flatten(-2).to(x.dtype)
+        qr, rk = rotate(q), rotate(k)
+        n = int(writes)
+        kr[:, 18720 + idx[:n]] = rk[:, :n]
+        vr[:, 18720 + idx[:n]] = v[:, :n]
+        qo = ext.rope_qk_scatter(q, k, v, cos, sin, kc, vc, 18720, idx, writes)
+        ok = torch.equal(qo, qr) and torch.equal(kc, kr) and torch.equal(vc, vr)
+        print(json.dumps({"kind": "sparse_correctness", "count": count, "capacity": capacity, "pass": ok}), flush=True)
+        assert ok
+
+sparse_check()
 for sf, off in ((0, 0), (6, 9360), (18, 24960), (18, 18720)):
     check(sf, off)
 timing()
