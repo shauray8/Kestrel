@@ -91,7 +91,8 @@
       "FA_RESCALE_THRESHOLD": "0.5",
       "RMS_ROPE": "1",
       "GLUE2": "1",
-      "FA_MX": "1"
+      "FA_MX": "1",
+      "FA_BAL": "1"
     },
     "best_spec": {
       "FUSED_GLUE": "1",
