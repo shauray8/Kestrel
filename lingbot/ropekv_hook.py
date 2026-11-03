@@ -19,33 +19,26 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             cos, sin = fi.real.float().to(x.device).contiguous(), fi.imag.float().to(x.device).contiguous()
             cache[key] = (cos, sin, torch.stack((cos[:, 0], sin[:, 0]), -1).flatten(1).contiguous())
         return (*cache[key], f * h * w)
-    def run_vm(q, k, v, cs, kc, vc, write_offset, lo, hi, advance):
+
+    def run_vm(q, k, v, cs, kc, vc, write_offset, lo, hi, advance, norm_q=None, norm_k=None, eps=1e-6):
         s, n, d = q.shape[1:]
         q2, k2, v2 = (t.view(s, n * d) for t in (q, k, v))
         kc2, vc2 = kc.view(kc.size(1), n * d), vc.view(vc.size(1), n * d)
         ak, av = kc2[lo:hi], vc2[lo:hi]
-        key = (s, n, d, kc2.size(0), hi - lo, write_offset, advance)
+        key = (s, n, d, kc2.size(0), hi - lo, write_offset, advance, norm_q is not None, norm_k is not None, eps)
         ent = programs.get(key)
         if ent is None:
-            p = vm.Program()
-            qi, ki, vi, ci, kci, vci, aki, avi = (p.tensor(t, name=name) for t, name in
-                                                   zip((q2, k2, v2, cs, kc2, vc2, ak, av),
-                                                       ("q", "k", "v", "cs", "kc", "vc", "ak", "av")))
-            shift_done = None
-            if advance is not None:
-                shift_done = p.join(p.kv_advance(kci, vci, *advance))
-            app = p.rope_kv_append(qi, ki, vi, ci, kci, vci, write_offset,
-                                   after=(lambda m: [shift_done]) if shift_done is not None else None)
-            append_done = p.join(app)
-            out = torch.empty_like(q2)
-            p.attn_window(qi, aki, avi, p.tensor(out, name="out"), after=lambda m, h: [append_done])
-            p.build()
+            p, out = vm.self_attention_program(q2, k2, v2, cs, kc2, vc2, lo, hi, write_offset, advance, norm_q, norm_k, eps)
             p.keep = []
             p.checked = False
             ent = programs[key] = (p, out)
         p, out = ent
         for name, t in zip(("q", "k", "v", "cs", "kc", "vc", "ak", "av"), (q2, k2, v2, cs, kc2, vc2, ak, av)):
             p.bind(name, t)
+        if norm_q is not None:
+            p.bind("norm_q", norm_q)
+        if norm_k is not None:
+            p.bind("norm_k", norm_k)
         p.run()
         if not p.checked:
             torch.cuda.synchronize()
@@ -56,13 +49,9 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             paths["attn_vm"] += 1
         return out.view_as(q)
 
-
-    def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
-                frame_seqlen=None, seq_lens_int=None):
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+    def attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
+               frame_seqlen=None, seq_lens_int=None, norm_in_vm=False):
+        b, s, n, d = *q.shape[:2], self.num_heads, self.head_dim
         if frame_seqlen is None:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
         start_frame = current_start // frame_seqlen
@@ -72,8 +61,7 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
                     q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and
                     kv_cache["k"].is_contiguous() and kv_cache["v"].is_contiguous())
         if not eligible:
-            return original(self, x, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
-                            frame_seqlen, seq_lens_int)
+            return None
         current_end = current_start + s
         sink_tokens = self.sink_size * frame_seqlen
         cache_size = kv_cache["k"].shape[1]
@@ -101,12 +89,30 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             local_start_index = local_end_index - s
         lo = max(0, local_end_index - max_attention_size)
         if use_vm:
-            out = run_vm(q, k, v, cs, kv_cache["k"], kv_cache["v"], local_start_index, lo, local_end_index, advance)
+            nq = self.norm_q.weight.view(1, -1).contiguous() if norm_in_vm else None
+            nk = self.norm_k.weight.view(1, -1).contiguous() if norm_in_vm else None
+            out = run_vm(q, k, v, cs, kv_cache["k"], kv_cache["v"], local_start_index, lo, local_end_index, advance, nq, nk, self.eps)
         else:
+            if norm_in_vm:
+                q, k = self.norm_q(q.flatten(2)).view_as(q), self.norm_k(k.flatten(2)).view_as(k)
             roped_query = ext.rope_qk_append(q, k, v, cos, sin, kv_cache["k"], kv_cache["v"], local_start_index)
             out = mf.attention(roped_query, kv_cache["k"][:, lo:local_end_index], kv_cache["v"][:, lo:local_end_index])
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
+        return out
+
+    def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
+                frame_seqlen=None, seq_lens_int=None):
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
+        out = attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
+                     frame_seqlen, seq_lens_int)
+        if out is None:
+            return original(self, x, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
+                            frame_seqlen, seq_lens_int)
         return self.o(out.flatten(2))
 
+    mf.CausalWanSelfAttention.vm_attend = attend
     mf.CausalWanSelfAttention.forward = forward

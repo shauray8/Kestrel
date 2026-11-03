@@ -9,7 +9,7 @@
 namespace {
 constexpr int BM = 128, BN = 128, BK = 64, STAGES = 3, THREADS = 256, WN = 4, TM = 64, TN = 32, MI = 4, NJ = 4;
 constexpr int A_BYTES = BM * BK, B_BYTES = BN * BK, SMEM = STAGES * (A_BYTES + B_BYTES), RB = THREADS / 32, JQ = 32;
-enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, OP_ATTN_WINDOW, NOP };
+enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, OP_ATTN_WINDOW, OP_QUANTIZE, OP_RMS_NORM, OP_GATED_RESIDUAL, NOP };
 enum : int { E_PLAIN, E_GELU, E_RES };
 enum : int { DT_F8, DT_BF16, DT_F32 };
 enum : int { ERR_TIMEOUT = 1, ERR_OPCODE = 2, ERR_OVERFLOW = 3 };
@@ -329,6 +329,136 @@ __device__ __forceinline__ bool op_rows_c(const Instr &I, const Tens *T) {
     default: return false;
   }
 }
+template <int NIT>
+__device__ __forceinline__ void op_quantize(const Instr &I, const Tens *T) {
+  constexpr int C = NIT * 256;
+  const Tens X = T[0], O = T[1];
+  const int m = I.m * RB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (m >= X.rows) return;
+  const int64_t xoff = (int64_t)m * X.stride + lane * 8, ooff = (int64_t)m * O.stride + lane * 8;
+  const float inv = 1.f / O.scale;
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    float v[8];
+    if (X.dtype == DT_F32) {
+      ldcg8((const float *)X.p + xoff + j * 256, v);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) v[k] = __bfloat162float(__float2bfloat16_rn(v[k]));
+    } else {
+      const uint4 raw = __ldcg(reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)X.p + xoff + j * 256));
+      const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const float2 f = __bfloat1622float2(h[k]);
+        v[2 * k] = f.x; v[2 * k + 1] = f.y;
+      }
+    }
+    uint2 pk;
+    uint16_t *q = reinterpret_cast<uint16_t *>(&pk);
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      q[k] = __nv_cvt_float2_to_fp8x2(make_float2(__fmul_rn(v[2 * k], inv), __fmul_rn(v[2 * k + 1], inv)), __NV_SATFINITE, __NV_E4M3);
+    *reinterpret_cast<uint2 *>((uint8_t *)O.p + ooff + j * 256) = pk;
+  }
+}
+
+__device__ __forceinline__ bool op_quantize_c(const Instr &I, const Tens *T) {
+  if ((T[0].dtype != DT_BF16 && T[0].dtype != DT_F32) || T[1].dtype != DT_F8 || T[0].rows != T[1].rows ||
+      T[0].cols != T[1].cols || T[0].stride % 8 || T[1].stride % 8) return false;
+  switch (T[0].cols) {
+    case 1024: op_quantize<4>(I, T); return true;
+    case 1536: op_quantize<6>(I, T); return true;
+    case 2048: op_quantize<8>(I, T); return true;
+    default: return false;
+  }
+}
+
+template <int NIT>
+__device__ __forceinline__ void op_rms_norm(const Instr &I, const Tens *T) {
+  constexpr int C = NIT * 256;
+  const Tens X = T[0], W = T[1], O = T[2];
+  const int m = I.m * RB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (m >= X.rows) return;
+  const int64_t xoff = (int64_t)m * X.stride + lane * 8, ooff = (int64_t)m * O.stride + lane * 8;
+  float v[NIT][8], ss = 0.f;
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    const uint4 raw = __ldcg(reinterpret_cast<const uint4 *>((const __nv_bfloat16 *)X.p + xoff + j * 256));
+    const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 f = __bfloat1622float2(h[k]);
+      v[j][2 * k] = f.x; v[j][2 * k + 1] = f.y;
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) ss = fmaf(v[j][k], v[j][k], ss);
+  }
+  const float rstd = rsqrtf(warp_sum(ss) * (1.f / C) + I.f);
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    uint4 pk;
+    __nv_bfloat162 *dst = reinterpret_cast<__nv_bfloat162 *>(&pk);
+    const __nv_bfloat16 *wr = (const __nv_bfloat16 *)W.p + lane * 8 + j * 256;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float a = __bfloat162float(__float2bfloat16_rn(__fmul_rn(v[j][2 * k], rstd)));
+      const float b = __bfloat162float(__float2bfloat16_rn(__fmul_rn(v[j][2 * k + 1], rstd)));
+      dst[k] = __floats2bfloat162_rn(__fmul_rn(a, __bfloat162float(wr[2 * k])),
+                                     __fmul_rn(b, __bfloat162float(wr[2 * k + 1])));
+    }
+    *reinterpret_cast<uint4 *>((__nv_bfloat16 *)O.p + ooff + j * 256) = pk;
+  }
+}
+
+__device__ __forceinline__ bool op_rms_norm_c(const Instr &I, const Tens *T) {
+  if (T[0].dtype != DT_BF16 || T[1].dtype != DT_BF16 || T[2].dtype != DT_BF16 || T[1].rows != 1 ||
+      T[1].cols != T[0].cols || T[2].rows != T[0].rows || T[2].cols != T[0].cols ||
+      T[0].stride % 8 || T[1].stride % 8 || T[2].stride % 8) return false;
+  switch (T[0].cols) {
+    case 1024: op_rms_norm<4>(I, T); return true;
+    case 1536: op_rms_norm<6>(I, T); return true;
+    case 2048: op_rms_norm<8>(I, T); return true;
+    default: return false;
+  }
+}
+
+template <int NIT>
+__device__ __forceinline__ void op_gated_residual(const Instr &I, const Tens *T) {
+  const Tens X = T[0], Y = T[1];
+  const Mod gate = mod_of(I, T, 2, X.rows);
+  const int m = I.m * RB + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (m >= X.rows) return;
+  float *xr = (float *)X.p + m * X.stride + lane * 8;
+  const __nv_bfloat16 *yr = (const __nv_bfloat16 *)Y.p + m * Y.stride + lane * 8;
+  const float *gr = gate.p ? gate.p + (m / gate.rows_per) * gate.stride + lane * 8 : nullptr;
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    float xv[8], gv[8];
+    ldcg8(xr + j * 256, xv);
+    const uint4 raw = __ldcg(reinterpret_cast<const uint4 *>(yr + j * 256));
+    const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+    if (gr) ldg8(gr + j * 256, gv);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 yf = __bfloat1622float2(h[k]);
+      xv[2 * k] = __fadd_rn(xv[2 * k], gr ? __fmul_rn(yf.x, gv[2 * k]) : yf.x);
+      xv[2 * k + 1] = __fadd_rn(xv[2 * k + 1], gr ? __fmul_rn(yf.y, gv[2 * k + 1]) : yf.y);
+    }
+    store8(xr + j * 256, xv);
+  }
+}
+
+__device__ __forceinline__ bool op_gated_residual_c(const Instr &I, const Tens *T) {
+  if (T[0].dtype != DT_F32 || T[1].dtype != DT_BF16 || T[0].rows != T[1].rows || T[0].cols != T[1].cols ||
+      T[0].stride % 8 || T[1].stride % 8) return false;
+  switch (T[0].cols) {
+    case 1024: op_gated_residual<4>(I, T); return true;
+    case 1536: op_gated_residual<6>(I, T); return true;
+    case 2048: op_gated_residual<8>(I, T); return true;
+    default: return false;
+  }
+}
+
 
 __device__ __forceinline__ bool op_kv_advance(const Instr &I, const Tens *T) {
   const Tens K = T[0], V = T[1];
@@ -531,6 +661,9 @@ __device__ __forceinline__ bool exec(const Instr &I, const Tens *T, uint8_t *sme
     case OP_ROPE_KV_APPEND: return op_rope_kv_append(I, T);
     case OP_KV_ADVANCE: return op_kv_advance(I, T);
     case OP_ATTN_WINDOW: return op_attn_window(I, T, smem);
+    case OP_QUANTIZE: return op_quantize_c(I, T);
+    case OP_RMS_NORM: return op_rms_norm_c(I, T);
+    case OP_GATED_RESIDUAL: return op_gated_residual_c(I, T);
     default: return false;
   }
 }
@@ -683,7 +816,7 @@ void vm_run(torch::Tensor ins, const std::vector<int64_t> &tt, torch::Tensor dep
   TORCH_CHECK(nq > 0 && nq <= n && nroots <= nq, "nq: instructions that take a queue slot (non-join), 0 < nq <= n");
   TORCH_CHECK(n > 0 && grid > 0 && state.scalar_type() == torch::kInt32 && state.is_contiguous() && state.numel() == C_N + 2 * n, "state: [5+2n] int32");
   TORCH_CHECK(deps.scalar_type() == torch::kInt32 && roots.scalar_type() == torch::kInt32 && nroots <= n, "deps/roots int32");
-  TORCH_CHECK(prof.scalar_type() == torch::kInt64 && prof.is_contiguous() && (prof.numel() == 0 || prof.numel() == 4 * NOP), "prof: [] or [4,7] int64");
+  TORCH_CHECK(prof.scalar_type() == torch::kInt64 && prof.is_contiguous() && (prof.numel() == 0 || prof.numel() == 4 * NOP), "prof: [] or [4,13] int64");
   init_attrs();
   auto st = at::cuda::getCurrentCUDAStream();
   const Instr *ip = reinterpret_cast<const Instr *>(ins.data_ptr());

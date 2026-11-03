@@ -6,8 +6,8 @@ import torch
 
 from kestrel import ops
 
-HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE, ATTN_WINDOW = range(10)
-OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window")
+HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE, ATTN_WINDOW, QUANTIZE, RMS_NORM, GATED_RESIDUAL = range(13)
+OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window", "quantize", "rms_norm", "gated_residual")
 ERRORS = ("ok", "timeout", "opcode", "overflow")
 BM, BN, RB, AQ, MAXT = 128, 128, 8, 64, 16
 _DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2}
@@ -105,6 +105,20 @@ class Program:
         for i in range(len(tiles) - stride):
             self.edge(tiles[i], tiles[i + stride])
         return tiles
+    def quantize(self, x, out, after=None):
+        M, C, dx = self.shapes[x]
+        assert dx in (torch.bfloat16, torch.float32) and self.shapes[out] == (M, C, torch.float8_e4m3fn)
+        return self._stage(lambda: [self.add(QUANTIZE, m, 0, (x, out), after=after(m) if after else ())
+                                    for m in range(_cdiv(M, RB))])
+
+    def rms_norm(self, x, weight, out, eps=1e-6, after=None):
+        M, C, dx = self.shapes[x]
+        assert dx == torch.bfloat16 and self.shapes[weight] == (1, C, torch.bfloat16) and self.shapes[out] == (M, C, dx)
+        return self._stage(lambda: [self.add(RMS_NORM, m, 0, (x, weight, out), eps, after=after(m) if after else ())
+                                    for m in range(_cdiv(M, RB))])
+
+    def gated_residual(self, x, y, gate=-1, after=None):
+        return self.rows(GATED_RESIDUAL, x, y=y, gate=gate, after=after)
     def attn_window(self, q, k, v, out, after=None):
         Lq, C, dq = self.shapes[q]
         Lk, Ck, dk = self.shapes[k]
@@ -119,6 +133,28 @@ class Program:
         for m in range(w or len(tiles), len(tiles)):
             for n, i in enumerate(tiles[m]):
                 self.edge(tiles[m - w][n], i)
+    def self_attention(self, q, k, v, cs, kc, vc, lo, hi, write_offset, advance=None, norm_q=None, norm_k=None, eps=1e-6):
+        out = torch.empty_like(q)
+        qi, ki, vi, ci, kci, vci = (self.tensor(t, name=name) for t, name in
+                                    zip((q, k, v, cs, kc, vc), ("q", "k", "v", "cs", "kc", "vc")))
+        aki, avi = self.tensor(kc[lo:hi], name="ak"), self.tensor(vc[lo:hi], name="av")
+        oi = self.tensor(out, name="out")
+        done = []
+        if norm_q is not None:
+            w = self.tensor(norm_q, name="norm_q")
+            done += self.rms_norm(qi, w, qi, eps)
+        if norm_k is not None:
+            w = self.tensor(norm_k, name="norm_k")
+            done += self.rms_norm(ki, w, ki, eps)
+        normalized = self.join(done) if done else None
+        shifted = None
+        if advance is not None:
+            shifted = self.join(self.kv_advance(kci, vci, *advance))
+        deps = [x for x in (normalized, shifted) if x is not None]
+        app = self.rope_kv_append(qi, ki, vi, ci, kci, vci, write_offset, after=lambda m: deps)
+        appended = self.join(app)
+        self.attn_window(qi, aki, avi, oi, after=lambda m, h: [appended])
+        return out
 
     def build(self, device="cuda"):
         n = len(self.instrs)
@@ -152,6 +188,82 @@ class Program:
     def status(self):
         head, tail, done, err, info = self.state[:5].tolist()
         return {"err": ERRORS[err], "info": info, "done": done, "n": self.n, "enqueued": tail}
+def self_attention_program(q, k, v, cs, kc, vc, lo, hi, write_offset, advance=None, norm_q=None, norm_k=None, eps=1e-6):
+    p = Program()
+    out = p.self_attention(q, k, v, cs, kc, vc, lo, hi, write_offset, advance, norm_q, norm_k, eps)
+    return p.build(), out
+
+def _quantized(p, x, sa, prefix="", after=None, xi=None):
+    x8 = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    xi = p.tensor(x, name=prefix + "x") if xi is None else xi
+    ti = p.tensor(x8, sa, name=prefix + "x8")
+    qt = p.quantize(xi, ti, after=after)
+    joins = [p.join(qt[m * BM // RB:(m + 1) * BM // RB]) for m in range(_cdiv(x.size(0), BM))]
+    return ti, joins
+
+def _linear(p, tx, joins, w, sw, b, y, prefix=""):
+    return p.gemm(tx, p.tensor(w, vscale=sw, name=prefix + "w"), p.tensor(y, name=prefix + "y"),
+                  p.tensor(b.view(1, -1), name=prefix + "b"), after=lambda m, n: [joins[m]])
+
+def linear_program(x, sa, w, sw, b, y, norm=None):
+    p = Program()
+    tx, joins = _normed(p, x, sa, "", norm)
+    _linear(p, tx, joins, w, sw, b, y)
+    return p.build()
+
+def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v):
+    p = Program()
+    norm = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    ni = p.tensor(norm, name="norm")
+    mod = p.rows(MOD_NORM, p.tensor(x, name="residual"), shift=p.tensor(shift, name="shift"),
+                 scale=p.tensor(scale, name="scale"), out=ni, eps=eps)
+    tx, joins = _quantized(p, norm, sa, after=lambda m: [mod[m]], xi=ni)
+    _linear(p, tx, joins, wq, swq, bq, q, "q")
+    _linear(p, tx, joins, wk, swk, bk, k, "k")
+    _linear(p, tx, joins, wv, swv, bv, v, "v")
+    return p.build()
+
+def _normed(p, x, sa, prefix="", norm=None):
+    if norm is None:
+        return _quantized(p, x, sa, prefix)
+    shift, scale, eps = norm
+    y = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    yi = p.tensor(y, name=prefix + "norm")
+    rows = p.rows(MOD_NORM, p.tensor(x, name=prefix + "residual"), shift=p.tensor(shift, name=prefix + "shift"),
+                  scale=p.tensor(scale, name=prefix + "scale"), out=yi, eps=eps)
+    return _quantized(p, y, sa, prefix, after=lambda m: [rows[m]], xi=yi)
+
+def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, norm=None):
+    p = Program()
+    tx, qjoins = _normed(p, x, sa, "q", norm)
+    tk, kjoins = _quantized(p, context, ska, "k")
+    _linear(p, tx, qjoins, wq, swq, bq, q, "q")
+    _linear(p, tk, kjoins, wk, swk, bk, k, "k")
+    _linear(p, tk, kjoins, wv, swv, bv, v, "v")
+    return p.build()
+
+def cross_attention_program(q, k, v, norm_q, norm_k=None, eps=1e-6):
+    p = Program()
+    qi, ki, vi = p.tensor(q, name="q"), p.tensor(k, name="k"), p.tensor(v, name="v")
+    out = torch.empty_like(q)
+    done = []
+    if norm_q is not None:
+        done += p.rms_norm(qi, p.tensor(norm_q, name="norm_q"), qi, eps)
+    if norm_k is not None:
+        done += p.rms_norm(ki, p.tensor(norm_k, name="norm_k"), ki, eps)
+    normalized = p.join(done) if done else None
+    p.attn_window(qi, ki, vi, p.tensor(out, name="out"), after=(lambda m, h: [normalized]) if normalized is not None else None)
+    return p.build(), out
+
+def o_residual_program(attn, sa, w, sw, b, y, x, gate):
+    p = Program()
+    tx, joins = _quantized(p, attn, sa)
+    tiles = _linear(p, tx, joins, w, sw, b, y)
+    done = [p.join(row) for row in tiles]
+    p.gated_residual(p.tensor(x, name="residual"), p.tensor(y, name="out"), p.tensor(gate, name="gate"),
+                     after=lambda m: [done[m * RB // BM]])
+    return p.build()
+
 
 def profile(p, it=10, ctas=None):
     prof = torch.zeros(4, len(OPS), dtype=torch.int64, device="cuda")
