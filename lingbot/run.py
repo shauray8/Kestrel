@@ -410,9 +410,15 @@ for tag, n1, calib, n2 in RUNS:
         prof.__enter__()
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
-    video = pipe.generate(prompt, img, action_path=EXAMPLE, chunk_size=chunk, max_area=MAX_AREA_CONFIGS[args.size],
-                          frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=int(os.environ.get("SEED", "42")), offload_model=False,
-                          **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
+    generate_fn = pipe.generate
+    stream_stats = None
+    if os.environ.get("STREAM") == "1":
+        from streaming import generate as stream_generate
+        stream_stats = {}
+        generate_fn = lambda *a, **kw: stream_generate(pipe, *a, stats=stream_stats, **kw)
+    video = generate_fn(prompt, img, action_path=EXAMPLE, chunk_size=chunk, max_area=MAX_AREA_CONFIGS[args.size],
+                        frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=int(os.environ.get("SEED", "42")), offload_model=False,
+                        **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
     torch.cuda.synchronize(); t1 = time.perf_counter()
     if prof is not None:
         prof.__exit__(None, None, None)
@@ -443,6 +449,8 @@ for tag, n1, calib, n2 in RUNS:
                                                  "p95": round(1e3 * lat[int(0.95 * len(lat))], 1), "max": round(1e3 * lat[-1], 1)},
                           "fps_e2e": round(4 * TAE_STATS["n"] / (tp[k - 1] - ts[0]), 2)}), flush=True)
     print(json.dumps({"exp": "n1_e2e", "tag": tag, "generate_s": round(t1 - t0, 2), "out": out}), flush=True)
+    if stream_stats is not None:
+        print(json.dumps({"exp": "stream", "tag": tag, **stream_stats}), flush=True)
     if CAM.get("mods"):
         PATHS["cam_cache_hits"] = CAM["hits"]
         PATHS["cam_cache_misses"] = CAM["miss"]
