@@ -1,218 +1,298 @@
+import math
 import os
+import numpy as np
 
 import torch
 
 from kestrel import vm
+from lingbot.vm_schedule import cache_plan
+
+def cross_norm(blk):
+    n = blk.norm3
+    if isinstance(n, torch.nn.Identity):
+        return None
+    C, dev = n.normalized_shape[0], blk.modulation.device
+    w = n.weight.detach().float().view(1, C) if n.weight is not None else torch.ones(1, C, device=dev)
+    b = n.bias.detach().float().view(1, C).contiguous() if n.bias is not None else torch.zeros_like(w)
+    return b, (w - 1).contiguous(), n.eps
+
+
+
+def block_parts(blk, x, e, ev, context, cross, target, buffers):
+    M, C = x.shape
+    mods = [ev[:, i * C:(i + 1) * C] for i in range(6)]
+    mp = vm.modulation_program(e, blk.modulation.view(1, -1).float(), ev, build=False)
+    q, k, v, out, projected, cq, ca, h0, h8 = buffers
+    a = blk.self_attn
+    linear = lambda l: (l.wq, l.sw, l.bias_bf16)
+    sq = vm.self_qkv_program(x, mods[0], mods[1], blk.norm1.eps, a.q.amax / target,
+                              *linear(a.q), *linear(a.k), *linear(a.v), q, k, v, build=False)
+    so = vm.o_residual_program(out, a.o.amax / target, *linear(a.o), projected, x, mods[2], build=False)
+    a = blk.cross_attn
+    norm = cross_norm(blk)
+    phases = []
+    for first in (True, False):
+        ck, cv = cross["k"].view(-1, C), cross["v"].view(-1, C)
+        if first:
+            cp = vm.cross_qkv_program(x, context, a.q.amax / target, a.k.amax / target,
+                                       *linear(a.q), *linear(a.k), *linear(a.v), cq, ck, cv, norm=norm, build=False)
+        else:
+            cp = vm.linear_program(x, a.q.amax / target, *linear(a.q), cq, norm=norm, build=False)
+        ap, ao = vm.cross_attention_program(cq, ck, cv, a.norm_q.weight.view(1, -1),
+                                            a.norm_k.weight.view(1, -1) if first else None, a.eps, build=False)
+        op = vm.linear_program(ao, a.o.amax / target, *linear(a.o), ca, build=False)
+        l0, l2 = blk.ffn.l0, blk.ffn.l2
+        fp = vm.ffn_glue_program(x, ca, *mods[3:], h0, l0.amax / target, *linear(l0),
+                                 h8, l2.amax / target, *linear(l2), blk.norm2.eps, build=False)
+        phases.append([("cq.", cp), ("ca.", ap), ("co.", op), ("ff.", fp)])
+    return mp, sq, so, phases
+
 
 def install(g):
     assert os.environ.get("FUSED_GLUE") == "1" and os.environ.get("FUSED_FFN") == "1"
     assert os.environ.get("ROPE_KV") == "1" and os.environ.get("VM_ATTN") == "1" and os.environ.get("ATTN", "n2") == "n2"
-    PATHS, MODE, TARGET, FusedFFN, fmod, orig, mf, pipe = (g[k] for k in
-        ("PATHS", "MODE", "TARGET", "FusedFFN", "fmod", "_glue_block_forward", "_mf_glue", "pipe"))
-    programs, scratch, norms = {}, {}, {}
+    PATHS, MODE, TARGET, FusedFFN, orig, mf, pipe = (g[k] for k in
+        ("PATHS", "MODE", "TARGET", "FusedFFN", "_glue_block_forward", "_mf_glue", "pipe"))
+    plans, parts, workspaces, ropetabs, prepared = {}, {}, {}, {}, set()
+    active, sample = None, None
+    frames = min(int(os.environ.get("FRAMES", "97")), np.load(f'{g["EXAMPLE"]}/poses.npy', mmap_mode="r").shape[0])
+    latent_frames = (frames - 1) // pipe.vae_stride[0] + 1
 
-    def lin_ok(l):
-        return (MODE["n1"] and hasattr(l, "wq") and l.ok and l.amax > 0 and l.bias_bf16 is not None)
-
-    def norm3(blk):
-        n = blk.norm3
-        if isinstance(n, torch.nn.Identity):
-            return None
-        ent = norms.get(id(blk))
-        if ent is None:
-            C, dev = n.normalized_shape[0], blk.modulation.device
-            w = n.weight.detach().float().view(1, C) if n.weight is not None else torch.ones(1, C, device=dev)
-            b = n.bias.detach().float().view(1, C).contiguous() if n.bias is not None else torch.zeros_like(w)
-            ent = norms[id(blk)] = (b, (w - 1).contiguous(), n.eps)
-        return ent
 
     def ready(blk):
-        return (MODE["n2"] and isinstance(blk.ffn, FusedFFN) and
-                (isinstance(blk.norm3, torch.nn.Identity) or isinstance(blk.norm3, torch.nn.LayerNorm)) and
-                all(lin_ok(l) for l in (blk.self_attn.q, blk.self_attn.k, blk.self_attn.v, blk.self_attn.o,
-                                       blk.cross_attn.q, blk.cross_attn.k, blk.cross_attn.v, blk.cross_attn.o,
-                                       blk.ffn.l0, blk.ffn.l2)))
+        return (MODE["n1"] and MODE.get("n2") and isinstance(blk.ffn, FusedFFN) and
+                isinstance(blk.norm3, (torch.nn.Identity, torch.nn.LayerNorm)) and all(
+                    hasattr(l, "wq") and l.ok and l.amax > 0 and l.bias_bf16 is not None for l in
+                    (blk.self_attn.q, blk.self_attn.k, blk.self_attn.v, blk.self_attn.o,
+                     blk.cross_attn.q, blk.cross_attn.k, blk.cross_attn.v, blk.cross_attn.o, blk.ffn.l0, blk.ffn.l2)))
+    assert len({(b.self_attn.local_attn_size, b.self_attn.sink_size) for b in pipe.model.blocks}) == 1
 
-    def run(p):
-        p.run()
-        if not p.checked:
-            torch.cuda.synchronize()
-            st = p.status()
-            assert st["err"] == "ok" and st["done"] == st["n"], st
-            p.checked = True
+    init_self, init_cross = pipe._initialize_self_kv_cache, pipe._initialize_crossattn_cache
 
-    def self_qkv(blk, x, shift, scale):
-        a = blk.self_attn
-        M, C = x.shape
-        sa = a.q.amax / TARGET
-        key = ("self_qkv", id(blk), M, C, shift.size(0), sa, blk.norm1.eps)
-        ent = programs.get(key)
-        if ent is None:
-            q, k, v = (torch.empty(M, C, dtype=torch.bfloat16, device=x.device) for _ in range(3))
-            p = vm.self_qkv_program(x, shift, scale, blk.norm1.eps, sa, a.q.wq, a.q.sw, a.q.bias_bf16,
-                                    a.k.wq, a.k.sw, a.k.bias_bf16, a.v.wq, a.v.sw, a.v.bias_bf16, q, k, v)
-            p.checked = False
-            ent = programs[key] = (p, q, k, v)
-        p, q, k, v = ent
-        p.bind("residual", x); p.bind("shift", shift); p.bind("scale", scale)
-        run(p)
-        return q, k, v
+    def self_cache(*a, **kw):
+        caches = init_self(*a, **kw)
+        for c in caches:
+            c["_vm_indices"] = (0, 0)
+        return caches
 
-    def self_o_residual(blk, attn, x, gate):
-        a, (M, C) = blk.self_attn, attn.shape
-        key = ("self_o", id(blk), M, C, gate.size(0), a.o.amax / TARGET)
-        ent = programs.get(key)
-        if ent is None:
-            y = torch.empty_like(attn)
-            p = vm.o_residual_program(attn, a.o.amax / TARGET, a.o.wq, a.o.sw, a.o.bias_bf16, y, x, gate)
-            p.checked = False
-            ent = programs[key] = p
-        p = ent
-        p.bind("x", attn); p.bind("residual", x); p.bind("gate", gate)
-        run(p)
+    def cross_cache(*a, **kw):
+        caches = init_cross(*a, **kw)
+        for c in caches:
+            c["_vm_first"] = True
+        return caches
 
-    def cross_qkv(blk, x, context, first):
-        a, (M, C), L = blk.cross_attn, x.shape, context.size(0)
-        key = ("cross_qkv" if first else "cross_q", id(blk), M, C, L, a.q.amax / TARGET, a.k.amax / TARGET)
-        ent = programs.get(key)
-        if ent is None:
-            q = torch.empty(M, C, dtype=torch.bfloat16, device=x.device)
-            nm = norm3(blk)
-            if first:
-                k, v = (torch.empty(L, C, dtype=torch.bfloat16, device=x.device) for _ in range(2))
-                p = vm.cross_qkv_program(x, context, a.q.amax / TARGET, a.k.amax / TARGET,
-                                         a.q.wq, a.q.sw, a.q.bias_bf16, a.k.wq, a.k.sw, a.k.bias_bf16,
-                                         a.v.wq, a.v.sw, a.v.bias_bf16, q, k, v, nm)
-            else:
-                k = v = None
-                p = vm.linear_program(x, a.q.amax / TARGET, a.q.wq, a.q.sw, a.q.bias_bf16, q, nm)
-            p.checked = False
-            p.xname = ("q" if first else "") + ("residual" if nm is not None else "x")
-            ent = programs[key] = (p, q, k, v)
-        p, q, k, v = ent
-        p.bind(p.xname, x)
-        if first:
-            p.bind("kx", context)
-        run(p)
-        return q, k, v
+    pipe._initialize_self_kv_cache, pipe._initialize_crossattn_cache = self_cache, cross_cache
 
-    def cross_attention(blk, q, k, v, first):
-        a = blk.cross_attn
-        key = ("cross_attn", id(blk), q.size(0), k.size(0), first, a.eps)
-        ent = programs.get(key)
-        if ent is None:
-            nq = a.norm_q.weight.view(1, -1).contiguous()
-            nk = a.norm_k.weight.view(1, -1).contiguous() if first else None
-            p, out = vm.cross_attention_program(q, k, v, nq, nk, a.eps)
-            p.checked = False
-            ent = programs[key] = (p, out)
-        p, out = ent
-        p.bind("q", q); p.bind("k", k); p.bind("v", v)
-        run(p)
+    def rope_table(shape, start, device):
+        key = (shape, start, device)
+        if key not in ropetabs:
+            f, h, w = shape
+            c = pipe.model.freqs.shape[1]
+            fs = pipe.model.freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+            fi = torch.cat([fs[0][start:start + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                            fs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                            fs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)], -1).reshape(f * h * w, -1)
+            ropetabs[key] = torch.stack((fi.real.float(), fi.imag.float()), -1).flatten(1).to(device).contiguous()
+        return ropetabs[key]
+
+    def prepare(shape, R, context_len, caches, crosses, max_attention, camera, starts):
+        M, C = shape[0] * shape[1] * shape[2], pipe.model.dim
+        device = caches[0]["k"].device
+        key = (M, C, R, context_len, device)
+        if key not in workspaces:
+            bf = lambda rows=M: torch.empty(rows, C, dtype=torch.bfloat16, device=device)
+            x = torch.empty(M, C, dtype=torch.float32, device=device)
+            e = torch.empty(R, 6 * C, dtype=torch.float32, device=device)
+            ev = torch.empty_like(e)
+            bufs = [bf() for _ in range(7)]
+            bufs += [torch.empty(M, C, dtype=torch.float8_e4m3fn, device=device),
+                     torch.empty(M, pipe.model.blocks[0].ffn.l0.wq.size(0), dtype=torch.float8_e4m3fn, device=device)]
+            workspaces[key] = x, e, ev, bf(context_len), bufs
+        x, e, ev, context, bufs = workspaces[key]
+        fs = shape[1] * shape[2]
+        oldg = oldl = 0
+        for start in starts:
+            a = pipe.model.blocks[0].self_attn
+            plan = cache_plan(start, M, oldg, oldl, caches[0]["k"].size(1), a.sink_size * fs, max_attention, a.local_attn_size != -1)
+            variants = [plan, cache_plan(start, M, plan.global_end, plan.local_end, caches[0]["k"].size(1),
+                                         a.sink_size * fs, max_attention, a.local_attn_size != -1)]
+            cs = rope_table(shape, start // fs, device)
+            for blk, kv, cross in zip(pipe.model.blocks, caches, crosses):
+                pk = (id(blk), key)
+                if pk not in parts:
+                    parts[pk] = block_parts(blk, x, e, ev, context, cross, TARGET, bufs)
+                mp, sq, so, cps = parts[pk]
+                for p in variants:
+                    for first in (True, False) if start == 0 else (False,):
+                        ck = (id(blk), key, p.global_end, p.write_offset, p.lo, p.local_end, p.advance, first, camera)
+                        if ck in plans:
+                            continue
+                        ap, ao = vm.self_attention_program(*bufs[:3], cs, kv["k"].view(-1, C), kv["v"].view(-1, C),
+                                                           p.lo, p.local_end, p.write_offset, p.advance,
+                                                           blk.self_attn.norm_q.weight.view(1, -1),
+                                                           blk.self_attn.norm_k.weight.view(1, -1), blk.self_attn.eps, build=False)
+                        ap.keep = [t for t in ap.keep if t is not ao]
+                        ap.bind("out", bufs[3])
+                        before = [("mod.", mp), ("sq.", sq), ("sa.", ap), ("so.", so)]
+                        after = cps[0 if first else 1]
+                        group = ([vm.Program.compose(before, build=False), vm.Program.compose(after, build=False)] if camera else
+                                 [vm.Program.compose(before + after, build=False)])
+                        group[-1].cache_commit(kv["global_end_index"], kv["local_end_index"], cross["is_init"],
+                                              p.global_end, p.local_end, first)
+                        plans[ck] = [program.build() for program in group]
+            oldg, oldl = plan.global_end, plan.local_end
+        return key
+
+    inner = pipe.model.forward
+
+    def model_forward(*args, **kw):
+        nonlocal active, sample
+        if args or kw.get("kv_cache") is None or kw.get("crossattn_cache") is None:
+            return inner(*args, **kw)
+        if not all(ready(b) for b in pipe.model.blocks):
+            sample = kw
+            out = inner(**kw)
+            for cache in kw["kv_cache"]:
+                cache.pop("_vm_indices", None)
+            for cache in kw["crossattn_cache"]:
+                cache.pop("_vm_first", None)
+            return out
+        caches, crosses = kw["kv_cache"], kw["crossattn_cache"]
+        raw = kw["x"][0]
+        patch = pipe.model.patch_size
+        shape = tuple(raw.shape[i + 1] // patch[i] for i in range(3))
+        M, fs = shape[0] * shape[1] * shape[2], shape[1] * shape[2]
+        R = 1 if os.environ.get("KESTREL_E_BCAST") == "1" and kw["t"].dim() == 1 else M
+        first = kw.get("cross_attn_first_call")
+        if first is None:
+            first = crosses[0].get("_vm_first")
+            if first is None:
+                first = not bool(crosses[0]["is_init"].item())
+        start = kw.get("current_start", 0)
+        camera = kw.get("dit_cond_dict") is not None and "c2ws_plucker_emb" in kw["dit_cond_dict"]
+        max_attention = kw.get("max_attention_size", 1_000_000)
+        old = caches[0].get("_vm_indices")
+        if old is None:
+            old = tuple(int(caches[0][name].item()) for name in ("global_end_index", "local_end_index"))
+        a = pipe.model.blocks[0].self_attn
+        p = cache_plan(start, M, *old, caches[0]["k"].size(1), a.sink_size * fs, max_attention, a.local_attn_size != -1)
+        starts = range(0, latent_frames // shape[0] * M, M)
+        signature = (shape, R, max_attention, camera)
+        if signature not in prepared:
+            key = prepare(shape, R, pipe.model.text_len, caches, crosses, max_attention, camera, starts)
+            prepared.add(signature)
+        else:
+            key = (M, pipe.model.dim, R, pipe.model.text_len, caches[0]["k"].device)
+        sample = None
+        cs = rope_table(shape, start // fs, raw.device)
+        active = key, p, bool(first), camera, cs
+        try:
+            out = inner(**{**kw, "cross_attn_first_call": bool(first), "frame_seqlen": fs})
+        finally:
+            active = None
+        for kv, cross in zip(caches, crosses):
+            kv["_vm_indices"] = (p.global_end, p.local_end)
+            cross["_vm_first"] = False
         return out
 
-    def cross_o(blk, attn):
-        a, (M, C) = blk.cross_attn, attn.shape
-        key = ("cross_o", id(blk), M, C, a.o.amax / TARGET)
-        ent = programs.get(key)
-        if ent is None:
-            y = torch.empty_like(attn)
-            p = vm.linear_program(attn, a.o.amax / TARGET, a.o.wq, a.o.sw, a.o.bias_bf16, y)
-            p.checked = False
-            ent = programs[key] = (p, y)
-        p, y = ent
-        p.bind("x", attn)
-        run(p)
-        return y
+    pipe.model.forward = model_forward
+    def warmup():
+        nonlocal sample
+        vm.grid()
+        if sample is None:
+            h, w = g["img"].size[1], g["img"].size[0]
+            area = g["MAX_AREA_CONFIGS"][g["args"].size]
+            aspect = h / w
+            patch, stride = pipe.model.patch_size, pipe.vae_stride
+            lat_h = round(math.sqrt(area * aspect) // stride[1] // patch[1] * patch[1])
+            lat_w = round(math.sqrt(area / aspect) // stride[2] // patch[2] * patch[2])
+            chunk = int(os.environ.get("CHUNK", "3"))
+            total = latent_frames // chunk * chunk
+            fs = lat_h * lat_w // (patch[1] * patch[2])
+            a = pipe.model.blocks[0].self_attn
+            capacity = fs * (a.local_attn_size if a.local_attn_size != -1 else total)
+            device = pipe.model.blocks[0].ffn.l0.wq.device
+            def cache(rows, cross=False):
+                values = {name: torch.empty(1, 1, a.num_heads, a.head_dim, dtype=torch.bfloat16, device=device).expand(1, rows, -1, -1)
+                          for name in ("k", "v")}
+                if cross:
+                    values["is_init"] = torch.empty((), dtype=torch.int32, device=device)
+                else:
+                    values.update({name: torch.empty(1, dtype=torch.int64, device=device)
+                                   for name in ("global_end_index", "local_end_index")})
+                return values
+            sample = {"x": [torch.empty(1, 1, 1, 1).expand(16, chunk, lat_h, lat_w)], "t": torch.empty(1),
+                      "kv_cache": [cache(capacity) for _ in pipe.model.blocks],
+                      "crossattn_cache": [cache(pipe.model.text_len, True) for _ in pipe.model.blocks],
+                      "dit_cond_dict": {"c2ws_plucker_emb": None}, "max_attention_size": capacity}
+        raw = sample["x"][0]
+        patch = pipe.model.patch_size
+        shape = tuple(raw.shape[i + 1] // patch[i] for i in range(3))
+        M = shape[0] * shape[1] * shape[2]
+        R = 1 if os.environ.get("KESTREL_E_BCAST") == "1" and sample["t"].dim() == 1 else M
+        camera = sample.get("dit_cond_dict") is not None and "c2ws_plucker_emb" in sample["dit_cond_dict"]
+        maximum = sample.get("max_attention_size", 1_000_000)
+        prepare(shape, R, pipe.model.text_len, sample["kv_cache"], sample["crossattn_cache"], maximum, camera,
+                range(0, latent_frames // shape[0] * M, M))
+        prepared.add((shape, R, maximum, camera))
+        external = {c[k].untyped_storage().data_ptr() for caches in (sample["kv_cache"], sample["crossattn_cache"]) for c in caches
+                    for k in c if isinstance(c[k], torch.Tensor)}
+        for group in plans.values():
+            for program in group:
+                program.keep = [t for t in program.keep if t is None or t.untyped_storage().data_ptr() not in external]
+        for mp, sq, so, groups in parts.values():
+            for program in [mp, sq, so, *(p for group in groups for _, p in group)]:
+                program.keep = [t for t in program.keep if t is None or t.untyped_storage().data_ptr() not in external]
+        sample = None
+        print(f'{{"exp": "vm_block_warmup", "programs": {sum(map(len, plans.values()))}}}', flush=True)
 
-    def ffn_glue(blk, x, ca, mods):
-        l0, l2 = blk.ffn.l0, blk.ffn.l2
-        (M, C), FF, R = x.shape, l0.wq.size(0), mods[0].size(0)
-        sa, sm = l0.amax / TARGET, l2.amax / TARGET
-        key = ("ffn", id(blk), M, C, FF, R, sa, sm, blk.norm2.eps)
-        ent = programs.get(key)
-        if ent is None:
-            bufs = scratch.get((M, C, FF))
-            if bufs is None:
-                E4 = torch.float8_e4m3fn
-                bufs = scratch[(M, C, FF)] = (torch.empty(M, C, dtype=E4, device=x.device),
-                                               torch.empty(M, FF, dtype=E4, device=x.device))
-            h0, h8 = bufs
-            p = vm.ffn_glue_program(x, ca, *mods, h0, sa, l0.wq, l0.sw, l0.bias_bf16,
-                                    h8, sm, l2.wq, l2.sw, l2.bias_bf16, blk.norm2.eps)
-            p.checked = False
-            ent = programs[key] = p
-        p = ent
-        for name, t in zip(("x", "ca", "shift", "scale", "gate"), (x, ca, *mods)):
-            p.bind(name, t)
-        run(p)
-        PATHS["ffn_vm"] += 1
+    g["VM_WARMUP"] = warmup
 
-    def block_forward(blk, x, x2, ev, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict,
-                      kv_cache, crossattn_cache, current_start, max_attention_size, frame_seqlen,
-                      cross_attn_first_call, seq_lens_int):
-        B, L, C = x.shape
-        if context_lens is not None and not (len(context_lens) == B and all(int(v) == context.size(1) for v in context_lens)):
-            return None
-        q, k, v = self_qkv(blk, x2, ev[0].contiguous(), ev[1].contiguous())
-        a = blk.self_attn
-        out = a.vm_attend(q.view(B, L, a.num_heads, a.head_dim), k.view(B, L, a.num_heads, a.head_dim),
-                          v.view(B, L, a.num_heads, a.head_dim), seq_lens, grid_sizes, freqs, kv_cache,
-                          current_start, max_attention_size, frame_seqlen, seq_lens_int, True)
-        if out is None:
-            return None
-        self_o_residual(blk, out.reshape(B * L, C).contiguous(), x2, ev[2].contiguous())
-        PATHS["block_vm_self"] += 1
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            emb = dit_cond_dict["c2ws_plucker_emb"]
-            h = blk.cam_injector_layer2(torch.nn.functional.silu(blk.cam_injector_layer1(emb)))
-            h = h + emb
-            x = (1.0 + blk.cam_scale_layer(h)) * x + blk.cam_shift_layer(h)
-            x = x.float().contiguous()
-            x2 = x.view(B * L, C)
-        first = cross_attn_first_call
-        if first is None:
-            first = crossattn_cache is None or int(crossattn_cache["is_init"].item()) == 0
-        first = bool(first or crossattn_cache is None)
-        context2 = context.reshape(-1, C).to(torch.bfloat16).contiguous()
-        q, k, v = cross_qkv(blk, x2, context2, first)
-        if not first:
-            k = crossattn_cache["k"].reshape(-1, C)
-            v = crossattn_cache["v"].reshape(-1, C)
-        out = cross_attention(blk, q, k, v, first)
-        if crossattn_cache is not None and first:
-            crossattn_cache["k"].copy_(k.view_as(crossattn_cache["k"]))
-            crossattn_cache["v"].copy_(v.view_as(crossattn_cache["v"]))
-            crossattn_cache["is_init"].fill_(1)
-        ca = cross_o(blk, out)
-        mods = [t.contiguous() for t in ev[3:6]]
-        ffn_glue(blk, x2, ca, mods)
-        PATHS["block_vm_cross"] += 1
-        PATHS["block_vm"] += 1
-        return x
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict=None, kv_cache=None,
                 crossattn_cache=None, current_start=0, max_attention_size=1_000_000, frame_seqlen=None,
                 cross_attn_first_call=None, seq_lens_int=None):
-        if not ready(self):
+        if active is None or context_lens is not None:
             PATHS["block_vm_fallback"] += 1
             return orig(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict, kv_cache, crossattn_cache,
                         current_start, max_attention_size, frame_seqlen, cross_attn_first_call, seq_lens_int)
-        with torch.amp.autocast('cuda', dtype=torch.float32):
-            e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-        e = [t.squeeze(2) for t in e]
-        B, L, C = x.shape
+        key, p, first, camera, cs = active
         x = x.float().contiguous()
-        x2 = x.view(B * L, C)
-        ev = [t.reshape(-1, C) if t.shape[1] != 1 else t.reshape(1, C) for t in e]
-        out = block_forward(self, x, x2, ev, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict,
-                            kv_cache, crossattn_cache, current_start, max_attention_size, frame_seqlen,
-                            cross_attn_first_call, seq_lens_int)
-        if out is None:
-            PATHS["block_vm_fallback"] += 1
-            return orig(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict, kv_cache, crossattn_cache,
-                        current_start, max_attention_size, frame_seqlen, cross_attn_first_call, seq_lens_int)
-        return out
+        ck = (id(self), key, p.global_end, p.write_offset, p.lo, p.local_end, p.advance, first, camera)
+        programs = plans[ck]
+        values = {"mod.e": e.reshape(-1, 6 * x.size(-1)), "sq.residual": x.view(-1, x.size(-1)),
+                  "sa.cs": cs, "sa.kc": kv_cache["k"].view(-1, x.size(-1)),
+                  "sa.vc": kv_cache["v"].view(-1, x.size(-1)),
+                  "sa.ak": kv_cache["k"].view(-1, x.size(-1))[p.lo:p.local_end],
+                  "sa.av": kv_cache["v"].view(-1, x.size(-1))[p.lo:p.local_end],
+                  "so.residual": x.view(-1, x.size(-1))}
+        def launch(program, bindings):
+            for name, tensor in bindings.items():
+                program.bind(name, tensor)
+            program.run()
+        if camera:
+            launch(programs[0], values)
+            emb = dit_cond_dict["c2ws_plucker_emb"]
+            h = self.cam_injector_layer2(torch.nn.functional.silu(self.cam_injector_layer1(emb))) + emb
+            x = ((1.0 + self.cam_scale_layer(h)) * x + self.cam_shift_layer(h)).float().contiguous()
+            values = {}
+        x2 = x.view(-1, x.size(-1))
+        input_name = ("q" if first else "") + ("x" if isinstance(self.norm3, torch.nn.Identity) else "residual")
+        values.update({"cq." + input_name: x2, "ff.x": x2})
+        ck2, cv2 = crossattn_cache["k"].view(-1, x.size(-1)), crossattn_cache["v"].view(-1, x.size(-1))
+        values.update({"ca.k": ck2, "ca.v": cv2})
+        values.update({"global_index": kv_cache["global_end_index"].view(1, 1),
+                       "local_index": kv_cache["local_end_index"].view(1, 1),
+                       "initialized": crossattn_cache["is_init"].view(1, 1)})
+        if first:
+            values.update({"cq.ky": ck2, "cq.vy": cv2})
+        if first:
+            values["cq.kx"] = context.view(-1, x.size(-1)).to(torch.bfloat16).contiguous()
+        launch(programs[-1], values)
+        PATHS["block_vm"] += 1
+        PATHS["ffn_vm"] += 1
+        PATHS["attn_vm"] += 1
+        return x
 
     mf.CausalWanAttentionBlock.forward = forward
-    print('{"exp": "vm_block_hook", "installed": true}', flush=True)
+    print('{"exp": "vm_block_hook", "installed": true, "merged": true}', flush=True)

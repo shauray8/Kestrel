@@ -9,7 +9,7 @@
 namespace {
 constexpr int BM = 128, BN = 128, BK = 64, STAGES = 3, THREADS = 256, WN = 4, TM = 64, TN = 32, MI = 4, NJ = 4;
 constexpr int A_BYTES = BM * BK, B_BYTES = BN * BK, SMEM = STAGES * (A_BYTES + B_BYTES), RB = THREADS / 32, JQ = 32;
-enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, OP_ATTN_WINDOW, OP_QUANTIZE, OP_RMS_NORM, OP_GATED_RESIDUAL, NOP };
+enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, OP_ATTN_WINDOW, OP_QUANTIZE, OP_RMS_NORM, OP_GATED_RESIDUAL, OP_CACHE_COMMIT, OP_MODULATE, NOP };
 enum : int { E_PLAIN, E_GELU, E_RES };
 enum : int { DT_F8, DT_BF16, DT_F32 };
 enum : int { ERR_TIMEOUT = 1, ERR_OPCODE = 2, ERR_OVERFLOW = 3 };
@@ -18,9 +18,10 @@ enum : int { C_HEAD, C_TAIL, C_DONE, C_ERR, C_INFO, C_N };
 struct Instr { int op, m, n, t[6]; float f; int n_pred, dep_begin, n_dep, pad[3]; };
 struct Tens { void *p; const float *vs; int64_t stride; int rows, cols, dtype; float scale; };
 struct Mod { const float *p; int64_t stride; int rows_per; };
-constexpr int MAXT = 16;
+constexpr int MAXT = 96;
 struct Table { Tens t[MAXT]; };
 static_assert(sizeof(Instr) == 64 && sizeof(Tens) == 40, "layout");
+static_assert(sizeof(Table) + 128 <= 4096, "kernel parameter budget");
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) { return (uint32_t)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ int swz(int row, int chunk) { return row * BK + ((chunk ^ ((row >> 1) & 3)) << 4); }
@@ -664,6 +665,24 @@ __device__ __forceinline__ bool exec(const Instr &I, const Tens *T, uint8_t *sme
     case OP_QUANTIZE: return op_quantize_c(I, T);
     case OP_RMS_NORM: return op_rms_norm_c(I, T);
     case OP_GATED_RESIDUAL: return op_gated_residual_c(I, T);
+    case OP_CACHE_COMMIT:
+      if (threadIdx.x == 0) {
+        *reinterpret_cast<int64_t *>(T[0].p) = I.m;
+        *reinterpret_cast<int64_t *>(T[1].p) = I.n;
+        if (I.f != 0.f) *reinterpret_cast<int32_t *>(T[2].p) = 1;
+      }
+      return true;
+    case OP_MODULATE: {
+      const int cols = T[0].cols, begin = I.m * RB;
+      for (int i = threadIdx.x; i < RB * cols; i += THREADS) {
+        const int row = begin + i / cols, col = i % cols;
+        if (row < T[0].rows)
+          reinterpret_cast<float *>(T[2].p)[row * T[2].stride + col] =
+              __fadd_rn(reinterpret_cast<const float *>(T[0].p)[row * T[0].stride + col],
+                        reinterpret_cast<const float *>(T[1].p)[col]);
+      }
+      return true;
+    }
     default: return false;
   }
 }
@@ -793,7 +812,7 @@ void check_ins(const torch::Tensor &ins) {
 }
 
 Table table(const std::vector<int64_t> &tt) {
-  TORCH_CHECK(tt.size() % 5 == 0 && tt.size() <= 5 * MAXT, "tensors: flat [t*5] int64, t <= 16");
+  TORCH_CHECK(tt.size() % 5 == 0 && tt.size() <= 5 * MAXT, "tensors: flat [t*5] int64, t <= ", MAXT);
   Table t{};
   std::memcpy(t.t, tt.data(), tt.size() * sizeof(int64_t));
   return t;
@@ -816,7 +835,7 @@ void vm_run(torch::Tensor ins, const std::vector<int64_t> &tt, torch::Tensor dep
   TORCH_CHECK(nq > 0 && nq <= n && nroots <= nq, "nq: instructions that take a queue slot (non-join), 0 < nq <= n");
   TORCH_CHECK(n > 0 && grid > 0 && state.scalar_type() == torch::kInt32 && state.is_contiguous() && state.numel() == C_N + 2 * n, "state: [5+2n] int32");
   TORCH_CHECK(deps.scalar_type() == torch::kInt32 && roots.scalar_type() == torch::kInt32 && nroots <= n, "deps/roots int32");
-  TORCH_CHECK(prof.scalar_type() == torch::kInt64 && prof.is_contiguous() && (prof.numel() == 0 || prof.numel() == 4 * NOP), "prof: [] or [4,13] int64");
+  TORCH_CHECK(prof.scalar_type() == torch::kInt64 && prof.is_contiguous() && (prof.numel() == 0 || prof.numel() == 4 * NOP), "prof: [] or [4,", NOP, "] int64");
   init_attrs();
   auto st = at::cuda::getCurrentCUDAStream();
   const Instr *ip = reinterpret_cast<const Instr *>(ins.data_ptr());

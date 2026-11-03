@@ -6,11 +6,11 @@ import torch
 
 from kestrel import ops
 
-HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE, ATTN_WINDOW, QUANTIZE, RMS_NORM, GATED_RESIDUAL = range(13)
-OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window", "quantize", "rms_norm", "gated_residual")
+HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOIN, ROPE_KV_APPEND, KV_ADVANCE, ATTN_WINDOW, QUANTIZE, RMS_NORM, GATED_RESIDUAL, CACHE_COMMIT, MODULATE = range(15)
+OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window", "quantize", "rms_norm", "gated_residual", "cache_commit", "modulate")
 ERRORS = ("ok", "timeout", "opcode", "overflow")
-BM, BN, RB, AQ, MAXT = 128, 128, 8, 64, 16
-_DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2}
+BM, BN, RB, AQ, MAXT = 128, 128, 8, 64, 96
+_DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2, torch.int64: 3, torch.int32: 4}
 
 def _cdiv(a, b):
     return (a + b - 1) // b
@@ -22,6 +22,41 @@ def grid():
 class Program:
     def __init__(self):
         self.tt, self.shapes, self.keep, self.instrs, self.stages, self.slots = [], [], [], [], [], {}
+
+    @classmethod
+    def compose(cls, programs, device="cuda", build=True):
+        p = cls()
+        previous = []
+        for prefix, part in programs:
+            remap = {}
+            for i, row in enumerate(part.tt):
+                match = next((j for j, r in enumerate(p.tt) if r == row), None)
+                if match is None:
+                    assert len(p.tt) < MAXT
+                    match = len(p.tt)
+                    p.tt.append(row[:])
+                    p.shapes.append(part.shapes[i])
+                remap[i] = match
+            p.keep.extend(part.keep)
+            p.slots.update({prefix + name: remap[i] for name, i in part.slots.items()})
+            barrier = p.join(previous) if previous else None
+            base = len(p.instrs)
+            used = {i for ins in part.instrs for i in ins[5]}
+            for op, m, n, tensors, f, after in part.instrs:
+                deps = [base + i for i in after]
+                if not after and barrier is not None:
+                    deps.append(barrier)
+                p.add(op, m, n, tuple(remap[i] if i >= 0 else i for i in tensors), f, deps)
+            previous = [base + i for i in range(len(part.instrs)) if i not in used]
+        return p.build(device) if build else p
+
+    def cache_commit(self, global_index, local_index, initialized, global_end, local_end, first):
+        assert global_index.dtype == local_index.dtype == torch.int64 and initialized.dtype == torch.int32
+        used = {i for ins in self.instrs for i in ins[5]}
+        leaves = [i for i in range(len(self.instrs)) if i not in used]
+        indices = [self.tensor(t.view(1, 1), name=name) for t, name in
+                   zip((global_index, local_index, initialized), ("global_index", "local_index", "initialized"))]
+        self.add(CACHE_COMMIT, global_end, local_end, indices, float(first), after=leaves)
 
     @staticmethod
     def _row(t, scale, vscale):
@@ -188,10 +223,10 @@ class Program:
     def status(self):
         head, tail, done, err, info = self.state[:5].tolist()
         return {"err": ERRORS[err], "info": info, "done": done, "n": self.n, "enqueued": tail}
-def self_attention_program(q, k, v, cs, kc, vc, lo, hi, write_offset, advance=None, norm_q=None, norm_k=None, eps=1e-6):
+def self_attention_program(q, k, v, cs, kc, vc, lo, hi, write_offset, advance=None, norm_q=None, norm_k=None, eps=1e-6, build=True):
     p = Program()
     out = p.self_attention(q, k, v, cs, kc, vc, lo, hi, write_offset, advance, norm_q, norm_k, eps)
-    return p.build(), out
+    return (p.build() if build else p), out
 
 def _quantized(p, x, sa, prefix="", after=None):
     x8 = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
@@ -204,13 +239,13 @@ def _linear(p, tx, joins, w, sw, b, y, prefix=""):
     return p.gemm(tx, p.tensor(w, vscale=sw, name=prefix + "w"), p.tensor(y, name=prefix + "y"),
                   p.tensor(b.view(1, -1), name=prefix + "b"), after=lambda m, n: [joins[m]])
 
-def linear_program(x, sa, w, sw, b, y, norm=None):
+def linear_program(x, sa, w, sw, b, y, norm=None, build=True):
     p = Program()
     tx, joins = _normed(p, x, sa, "", norm)
     _linear(p, tx, joins, w, sw, b, y)
-    return p.build()
+    return p.build() if build else p
 
-def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v):
+def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, build=True):
     p = Program()
     norm = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
     mod = p.rows(MOD_NORM, p.tensor(x, name="residual"), shift=p.tensor(shift, name="shift"),
@@ -219,7 +254,7 @@ def self_qkv_program(x, shift, scale, eps, sa, wq, swq, bq, wk, swk, bk, wv, swv
     _linear(p, tx, joins, wq, swq, bq, q, "q")
     _linear(p, tx, joins, wk, swk, bk, k, "k")
     _linear(p, tx, joins, wv, swv, bv, v, "v")
-    return p.build()
+    return p.build() if build else p
 
 def _normed(p, x, sa, prefix="", norm=None):
     if norm is None:
@@ -230,16 +265,16 @@ def _normed(p, x, sa, prefix="", norm=None):
                   scale=p.tensor(scale, name=prefix + "scale"), out=p.tensor(y, name=prefix + "norm"), eps=eps)
     return _quantized(p, y, sa, prefix, after=lambda m: [rows[m]])
 
-def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, norm=None):
+def cross_qkv_program(x, context, sa, ska, wq, swq, bq, wk, swk, bk, wv, swv, bv, q, k, v, norm=None, build=True):
     p = Program()
     tx, qjoins = _normed(p, x, sa, "q", norm)
     tk, kjoins = _quantized(p, context, ska, "k")
     _linear(p, tx, qjoins, wq, swq, bq, q, "q")
     _linear(p, tk, kjoins, wk, swk, bk, k, "k")
     _linear(p, tk, kjoins, wv, swv, bv, v, "v")
-    return p.build()
+    return p.build() if build else p
 
-def cross_attention_program(q, k, v, norm_q, norm_k=None, eps=1e-6):
+def cross_attention_program(q, k, v, norm_q, norm_k=None, eps=1e-6, build=True):
     p = Program()
     qi, ki, vi = p.tensor(q, name="q"), p.tensor(k, name="k"), p.tensor(v, name="v")
     out = torch.empty_like(q)
@@ -250,16 +285,16 @@ def cross_attention_program(q, k, v, norm_q, norm_k=None, eps=1e-6):
         done += p.rms_norm(ki, p.tensor(norm_k, name="norm_k"), ki, eps)
     normalized = p.join(done) if done else None
     p.attn_window(qi, ki, vi, p.tensor(out, name="out"), after=(lambda m, h: [normalized]) if normalized is not None else None)
-    return p.build(), out
+    return (p.build() if build else p), out
 
-def o_residual_program(attn, sa, w, sw, b, y, x, gate):
+def o_residual_program(attn, sa, w, sw, b, y, x, gate, build=True):
     p = Program()
     tx, joins = _quantized(p, attn, sa)
     tiles = _linear(p, tx, joins, w, sw, b, y)
     done = [p.join(row) for row in tiles]
     p.gated_residual(p.tensor(x, name="residual"), p.tensor(y, name="out"), p.tensor(gate, name="gate"),
                      after=lambda m: [done[m * RB // BM]])
-    return p.build()
+    return p.build() if build else p
 
 
 def profile(p, it=10, ctas=None):
@@ -283,7 +318,7 @@ def ffn_program(x8, sa, w0, sw0, b0, h8, s_mid, w2, sw2, b2, y, window=None):
     p.up, p.dn = ffn(p, p.tensor(x8, sa), w0, sw0, b0, h8, s_mid, w2, sw2, b2, p.tensor(y), window=window)
     return p.build()
 
-def ffn_glue_program(x, ca, shift, scale, gate, h0, sa, w0, sw0, b0, h8, s_mid, w2, sw2, b2, eps=1e-6, window=None):
+def ffn_glue_program(x, ca, shift, scale, gate, h0, sa, w0, sw0, b0, h8, s_mid, w2, sw2, b2, eps=1e-6, window=None, build=True):
     p = Program()
     tx, th0 = p.tensor(x, name="x"), p.tensor(h0, sa, name="h0")
     p.pre = p.rows(RESIDUAL_MOD_NORM, tx, y=p.tensor(ca, name="ca"), shift=p.tensor(shift, name="shift"), scale=p.tensor(scale, name="scale"),
@@ -291,4 +326,13 @@ def ffn_glue_program(x, ca, shift, scale, gate, h0, sa, w0, sw0, b0, h8, s_mid, 
     pj = [p.join(p.pre[m * BM // RB:(m + 1) * BM // RB]) for m in range(_cdiv(x.size(0), BM))]
     p.up, p.dn = ffn(p, th0, w0, sw0, b0, h8, s_mid, w2, sw2, b2, tx, gate=p.tensor(gate, name="gate"), window=window,
                      after=lambda m, n: [pj[m]])
-    return p.build()
+    return p.build() if build else p
+
+def modulation_program(e, modulation, out, build=True):
+    p = Program()
+    assert e.shape == out.shape and modulation.shape == (1, e.size(1))
+    assert e.dtype == modulation.dtype == out.dtype == torch.float32
+    tensors = tuple(p.tensor(t, name=name) for t, name in zip((e, modulation, out), ("e", "modulation", "out")))
+    for row in range(_cdiv(e.size(0), RB)):
+        p.add(MODULATE, row, t=tensors)
+    return p.build() if build else p
