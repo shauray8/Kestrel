@@ -78,13 +78,10 @@ def main():
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--allow-missing-sage", action="store_true")
     ap.add_argument("--json", type=Path, help="also write all result records as a JSON array")
-    ap.add_argument("--pipe", default="0", help="comma-separated 0,1; 1 software-pipelines QK^T (load-mode 3, q-tile 128)")
     args = ap.parse_args()
     try:
-        modes = [m for m in itertools.product(numbers(args.load_mode, int, (0, 1, 3)), numbers(args.exp_mode, int, (0, 1, 2)),
-                                              numbers(args.rescale_threshold, float), numbers(args.q_tile, int, (64, 128)),
-                                              numbers(args.pipe, int, (0, 1)))
-                 if not m[4] or (m[0] == 3 and m[3] == 128)]
+        modes = list(itertools.product(numbers(args.load_mode, int, (0, 1, 3)), numbers(args.exp_mode, int, (0, 1, 2)),
+                                       numbers(args.rescale_threshold, float), numbers(args.q_tile, int, (64, 128))))
     except ValueError as exc:
         ap.error(str(exc))
     if any(mode[2] > 0.5 for mode in modes):
@@ -152,15 +149,14 @@ def main():
                     ext.fa_quant(x, packed, scales, 0, (x.shape[0] + 63) // 64, i == 2, 1 if i == 2 else 8)
             quantize()
             (q8, qs), (k8, ks), (v8, vs) = buffers
-            unpiped = {}
             for mode in modes:
                 plan = ext.fa_plan(k8, v8) if mode[0] in (1, 3) else None
                 def cached():
-                    return ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, *mode[:3], plan, mode[3], bool(mode[4]))
+                    return ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, *mode[:3], plan, mode[3])
                 def inclusive():
                     quantize()
                     return cached()
-                fa = FAttention(mode="fp8", load_mode=mode[0], exp_mode=mode[1], rescale_threshold=mode[2], q_tile=mode[3], pipe=mode[4])
+                fa = FAttention(mode="fp8", load_mode=mode[0], exp_mode=mode[1], rescale_threshold=mode[2], q_tile=mode[3])
                 fa(0, q[None], k[None], v[None])
                 methods = {"fa_cached": cached, "fa_quant_inclusive": inclusive,
                            "fa_history_cached": lambda: fa(0, q[None], k[None], v[None])[0]}
@@ -168,17 +164,13 @@ def main():
                 if not torch.isfinite(out).all():
                     raise RuntimeError(f"FA produced nonfinite output for {name}, mode {mode}")
                 accuracy = {"reference_queries": nr, "rel_fp32": relative(out[:nr], ref)} if nr else {}
-                if not mode[4]:
-                    unpiped[mode[:4]] = out
-                elif mode[:4] in unpiped:
-                    accuracy["max_abs_vs_unpiped"] = float((out.float() - unpiped[mode[:4]].float()).abs().max())
                 if nr and "sage2" in baseline_out:
                     accuracy["rel_sage2"] = relative(out[:nr], baseline_out["sage2"])
                 for method, fn in methods.items():
                     ms = timing(fn, args.warmup, args.iters, args.graph)
                     tops = flops / ms / 1e9
                     emit({"kind": "fa_speed", **base, "method": method, "load_mode": mode[0], "exp_mode": mode[1],
-                          "rescale_threshold": mode[2], "q_tile": mode[3], "pipe": mode[4], "ms": ms, "tops": tops, "percent_peak": 100 * tops / 1016,
+                          "rescale_threshold": mode[2], "q_tile": mode[3], "ms": ms, "tops": tops, "percent_peak": 100 * tops / 1016,
                           "speedup_n2": baseline_ms["n2_fp16"] / ms,
                           **({"speedup_sage2": baseline_ms["sage2"] / ms} if "sage2" in baseline_ms else {}), **accuracy})
     if not count:

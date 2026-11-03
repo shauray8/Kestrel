@@ -173,19 +173,6 @@ def test_query_tile_parity(mode):
     print(json.dumps({"kind": "fa_query_tile", "mode": mode, "rel_64_128": parity, "rel_64_fp32": error}), flush=True)
     assert parity <= KERNEL_REL and error <= QUANT_REL + KERNEL_REL
 
-@pytest.mark.parametrize("exp_mode", (0, 1, 2))
-@pytest.mark.parametrize("lq,lk", ((33, 64), (129, 65), (129, 385), (3120, 9360)))
-def test_pipe_bit_exact(exp_mode, lq, lk):
-    ext = ops.fa()
-    q, k, v = tensors(lq, lk)
-    (q8, qs), (k8, ks), (v8, vs) = pack(ext, q), pack(ext, k), pack(ext, v, True, 1)
-    plan = ext.fa_plan(k8, v8)
-    base = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, False)
-    piped = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, True)
-    integrated = FAttention(mode="fp8", load_mode=3, exp_mode=exp_mode, rescale_threshold=0.5, q_tile=128, pipe=True)
-    assert torch.equal(base, piped)
-    assert torch.equal(piped, integrated(0, q[None], k[None], v[None])[0])
-
 @pytest.mark.parametrize("mode", MODES)
 def test_nondefault_stream(mode):
     ops.fa()
