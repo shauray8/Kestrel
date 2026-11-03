@@ -427,10 +427,20 @@ for tag, n1, calib, n2 in RUNS:
     if os.environ.get("TAE_LIVE") == "1":
         TAE_STATS.update(n=0, ms=0.0, frames=[], t_start=[], t_pix=[], last_start=None)
         _stream.reset()
-    prof = None
+    prof, prof_t = None, []
     if os.environ.get("PROFILE") == "1" and tag == os.environ.get("PROFILE_TAG", RUNS[-1][0]):
         prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
         prof.__enter__()
+        if os.environ.get("PROFILE_DIT") == "1":
+            _vae_decode = pipe.vae.decode
+
+            def _decode_unprofiled(*a, **kw):
+                if not prof_t:
+                    torch.cuda.synchronize(); prof_t.append(time.perf_counter())
+                    prof.__exit__(None, None, None)
+                return _vae_decode(*a, **kw)
+
+            pipe.vae.decode = _decode_unprofiled
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
     generate_fn = pipe.generate
@@ -444,9 +454,12 @@ for tag, n1, calib, n2 in RUNS:
                         **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
     torch.cuda.synchronize(); t1 = time.perf_counter()
     if prof is not None:
-        prof.__exit__(None, None, None)
+        if os.environ.get("PROFILE_DIT") == "1":
+            pipe.vae.decode = _vae_decode
+        if not prof_t:
+            prof.__exit__(None, None, None)
         from kestrel.timeline import summarize
-        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, t1 - t0)}), flush=True)
+        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, (prof_t[0] if prof_t else t1) - t0)}), flush=True)
     out = f"{OUT}/{os.path.basename(EXAMPLE)}_{tag}_c{chunk}.mp4"
     save_video(tensor=video[None], save_file=out, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
     if os.environ.get("TAE_LIVE") == "1" and TAE_STATS["n"]:
