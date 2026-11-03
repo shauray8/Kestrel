@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
@@ -74,8 +75,11 @@ __device__ __forceinline__ void expect(uint64_t *p) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(shared(p)), "r"(2 * TILE) : "memory");
 }
 
-template <bool Transpose>
-__global__ void fa_quant_kernel(const half *__restrict__ x, uint8_t *__restrict__ out, float *__restrict__ scales,
+__device__ __forceinline__ float2 load2(const half *p) { return __half22float2(*reinterpret_cast<const __half2 *>(p)); }
+__device__ __forceinline__ float2 load2(const __nv_bfloat16 *p) { return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(p)); }
+
+template <typename In, bool Transpose>
+__global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ out, float *__restrict__ scales,
                                 int L, int H, int nb, int first, float target) {
   __shared__ float maxima[8];
   __shared__ uint8_t tile[Transpose ? TILE : 1];
@@ -85,8 +89,7 @@ __global__ void fa_quant_kernel(const half *__restrict__ x, uint8_t *__restrict_
 #pragma unroll
   for (int j = 0; j < 16; ++j) {
     int pair = tid + j * T, row = pair / 64, col = (pair % 64) * 2, token = block * BK + row;
-    __half2 a = token < L ? *reinterpret_cast<const __half2 *>(x + (size_t(token) * H + head) * D + col) : __float2half2_rn(0.f);
-    values[j] = __half22float2(a);
+    values[j] = token < L ? load2(x + (size_t(token) * H + head) * D + col) : make_float2(0.f, 0.f);
     mx = fmaxf(mx, fmaxf(fabsf(values[j].x), fabsf(values[j].y)));
   }
 #pragma unroll
@@ -349,7 +352,8 @@ void launch(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor 
 }
 
 void fa_quant(torch::Tensor x, torch::Tensor packed, torch::Tensor scales, int start, int stop, bool transpose, double target) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kHalf && x.dim() == 3 && x.size(2) == D && x.is_contiguous(), "x must be contiguous CUDA fp16 [L,H,128]");
+  const bool bf = x.scalar_type() == torch::kBFloat16;
+  TORCH_CHECK(x.is_cuda() && (bf || x.scalar_type() == torch::kHalf) && x.dim() == 3 && x.size(2) == D && x.is_contiguous(), "x must be contiguous CUDA fp16/bf16 [L,H,128]");
   const c10::cuda::CUDAGuard guard(x.device());
   check_packed(packed, "packed");
   int L = x.size(0), H = x.size(1), nb = (L + BK - 1) / BK;
@@ -360,8 +364,18 @@ void fa_quant(torch::Tensor x, torch::Tensor packed, torch::Tensor scales, int s
   TORCH_CHECK(0 <= start && start <= stop && stop <= nb && target > 0 && std::isfinite(target), "invalid quant block range/target");
   if (start == stop || H == 0) return;
   dim3 grid(stop - start, H);
-  if (transpose) fa_quant_kernel<true><<<grid, T, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<half *>(x.data_ptr()), packed.data_ptr<uint8_t>(), scales.data_ptr<float>(), L, H, nb, start, target);
-  else fa_quant_kernel<false><<<grid, T, 0, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<half *>(x.data_ptr()), packed.data_ptr<uint8_t>(), scales.data_ptr<float>(), L, H, nb, start, target);
+  auto st = at::cuda::getCurrentCUDAStream();
+  uint8_t *po = packed.data_ptr<uint8_t>();
+  float *ps = scales.data_ptr<float>();
+  if (bf) {
+    auto px = reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr());
+    if (transpose) fa_quant_kernel<__nv_bfloat16, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+    else fa_quant_kernel<__nv_bfloat16, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+  } else {
+    auto px = reinterpret_cast<const half *>(x.data_ptr());
+    if (transpose) fa_quant_kernel<half, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+    else fa_quant_kernel<half, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

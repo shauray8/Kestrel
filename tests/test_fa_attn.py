@@ -84,6 +84,22 @@ def check(q, k, v, mode, sage=False, label=None):
     assert total_error <= QUANT_REL + KERNEL_REL, row
     return out
 
+@pytest.mark.parametrize("transpose,target", [(False, 8), (True, 1)])
+def test_bf16_source_matches_fp16(transpose, target):
+    ext = ops.fa()
+    x = (tensors(193, 193)[0].float() * 3).bfloat16()
+    a, sa = pack(ext, x, transpose, target)
+    b, sb = pack(ext, x.half(), transpose, target)
+    assert torch.equal(a, b) and torch.equal(sa, sb)
+
+def test_bf16_model_inputs_need_no_fp16_copies():
+    q, k, v = (x.bfloat16()[None] for x in tensors(65, 194))
+    fa = FAttention(mode="fp8", load_mode=0, exp_mode=0, rescale_threshold=0)
+    out = fa(0, q, k, v)
+    ref = FAttention(mode="fp8", load_mode=0, exp_mode=0, rescale_threshold=0)(0, q.half(), k.half(), v.half())
+    assert torch.equal(out, ref.to(out.dtype))
+    assert not any(name in fa.state[0] for name in ("kf", "vf"))
+
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("lq,lk,kind", [(1, 1, "random"), (17, 65, "random"), (65, 193, "random"),
                                         (33, 129, "constant"), (63, 127, "zero")])

@@ -2,6 +2,9 @@ import os
 import torch
 from kestrel import ops
 
+def _src(x):
+    return x if x.dtype in (torch.float16, torch.bfloat16) and x.is_contiguous() else x.half().contiguous()
+
 
 class FAttention:
     def __init__(self, mode=None, load_mode=None, exp_mode=None, rescale_threshold=None, q_tile=None):
@@ -43,20 +46,13 @@ class FAttention:
                                        ("ks", (h, nk), torch.float32),
                                        ("vs", (h, nk), torch.float32)):
                 st[name] = torch.empty(shape, dtype=dtype, device=q.device)
-            for name, x in (("kf", k), ("vf", v)):
-                st[name] = None if x.dtype == torch.float16 and x[0].is_contiguous() else torch.empty(x.shape[1:], dtype=torch.float16, device=x.device)
             self.state[layer] = st
         rebuild = st["epoch"] != self.epoch
         ext = ops.fa()
         if fresh and self.load_mode in (1, 3):
             st["plan"] = ext.fa_plan(st["k8"], st["v8"])
-        for x, name, packed, scales, transpose, target in ((k, "kf", "k8", "ks", False, 8), (v, "vf", "v8", "vs", True, 1)):
-            buf = st[name]
-            if buf is None:
-                buf = x[0]
-            else:
-                start = 0 if rebuild else st["La"]
-                buf[start:].copy_(x[0, start:])
+        for x, packed, scales, transpose, target in ((k, "k8", "ks", False, 8), (v, "v8", "vs", True, 1)):
+            buf = _src(x[0])
             if rebuild and st["La"]:
                 ext.fa_quant(buf, st[packed], st[scales], 0, st["La"] // 64, transpose, target)
             ext.fa_quant(buf, st[packed], st[scales], st["La"] // 64, (L + 63) // 64, transpose, target)
@@ -71,7 +67,7 @@ class FAttention:
             return ops.n2().n2_attention(q[0].half().contiguous(), k[0].half().contiguous(), v[0].half().contiguous())[None].to(q.dtype)
         st = self._hist(layer, q, k, v)
         ext = ops.fa()
-        ext.fa_quant(q[0].half().contiguous(), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 8)
+        ext.fa_quant(_src(q[0]), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 8)
         out = ext.fa_attention(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"], q.shape[1], k.shape[1],
                                q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold, st.get("plan"), self.q_tile)
         return out[None].to(q.dtype)
