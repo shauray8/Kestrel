@@ -6,9 +6,19 @@
 #include <cstdint>
 #include <cstring>
 
+#include "attn_window.cuh"
+#ifndef VM_ATTN_PERF
+#define VM_ATTN_PERF 0
+#endif
+#if VM_ATTN_PERF
+constexpr int VM_MIN_BLOCKS = 1;
+#else
+constexpr int VM_MIN_BLOCKS = 2;
+#endif
 namespace {
 constexpr int BM = 128, BN = 128, BK = 64, STAGES = 3, THREADS = 256, WN = 4, TM = 64, TN = 32, MI = 4, NJ = 4;
 constexpr int A_BYTES = BM * BK, B_BYTES = BN * BK, SMEM = STAGES * (A_BYTES + B_BYTES), RB = THREADS / 32, JQ = 32;
+constexpr int VM_SMEM = VM_ATTN_PERF == 96 ? 96 * 1024 : SMEM;
 enum : int { OP_HALT, OP_GEMM_F8, OP_GEMM_F8_GELU, OP_MOD_NORM, OP_RESIDUAL_MOD_NORM, OP_GEMM_F8_GATED_RES, OP_JOIN, OP_ROPE_KV_APPEND, OP_KV_ADVANCE, OP_ATTN_WINDOW, OP_QUANTIZE, OP_RMS_NORM, OP_GATED_RESIDUAL, NOP };
 enum : int { E_PLAIN, E_GELU, E_RES };
 enum : int { DT_F8, DT_BF16, DT_F32 };
@@ -50,7 +60,7 @@ __device__ __forceinline__ void rotate8(uint4 raw, const float *cs, uint4 &out) 
                                    __fadd_rn(__fmul_rn(x.x, s), __fmul_rn(x.y, c)));
   }
 }
-constexpr int AQ = 64, AK = 64, AD = 128, AROWB = AD * 2, AWARPS = 4;
+constexpr int AQ = VM_ATTN_PERF ? 128 : 64, AK = 64, AD = 128, AROWB = AD * 2, AWARPS = 4;
 __device__ __forceinline__ int aswz(int row, int chunk) { return row * AROWB + ((chunk ^ (row & 7)) << 4); }
 __device__ __forceinline__ void ldsm_x4_t(uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3, uint32_t a) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
@@ -505,6 +515,9 @@ __device__ __forceinline__ bool op_attn_window(const Instr &I, const Tens *T, ui
       K.rows <= 0 || V.rows != K.rows || O.rows != Q.rows || Q.stride != Q.cols || K.stride != K.cols ||
       V.stride != V.cols || O.stride != O.cols || I.m < 0 || I.m * AQ >= Q.rows ||
       I.n < 0 || I.n >= Q.cols / AD || I.f <= 0.f) return false;
+#if VM_ATTN_PERF
+  kestrel_attn::run<true, VM_ATTN_PERF == 96>(Q.p, K.p, V.p, O.p, Q.rows, K.rows, Q.cols / AD, I.m * AQ, I.n, I.f, smem);
+#else
   uint8_t *sQ = smem, *sK = smem + AQ * AROWB, *sV = sK + AK * AROWB;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = I.n, q0 = I.m * AQ;
   const int Lq = Q.rows, Lk = K.rows;
@@ -647,6 +660,7 @@ __device__ __forceinline__ bool op_attn_window(const Instr &I, const Tens *T, ui
       }
     }
   }
+#endif
   return true;
 }
 
@@ -688,8 +702,8 @@ __global__ void k_reset(const Instr *__restrict__ ins, const int *__restrict__ r
   if (i < C_N) ctl[i] = i == C_TAIL ? nroots : 0;
 }
 
-__global__ void __launch_bounds__(THREADS, 2) k_vm(const Instr *__restrict__ ins, const __grid_constant__ Table tab, const int *__restrict__ deps, int nq,
-                                                   int *ctl, int *pending, int *queue, unsigned long long *prof, uint64_t timeout) {
+__global__ void __launch_bounds__(THREADS, VM_MIN_BLOCKS) k_vm(const Instr *__restrict__ ins, const __grid_constant__ Table tab, const int *__restrict__ deps, int nq,
+                                                               int *ctl, int *pending, int *queue, unsigned long long *prof, uint64_t timeout) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ int s_idx, s_cnt, s_base, s_nj, s_join[JQ];
   __shared__ Instr sI;
@@ -772,7 +786,7 @@ __global__ void __launch_bounds__(THREADS, 2) k_vm(const Instr *__restrict__ ins
   if (prof && tid < 4 * NOP) atomicAdd(prof + tid, s_prof[tid]);
 }
 
-__global__ void __launch_bounds__(THREADS, 2) k_tiles(const Instr *__restrict__ ins, const __grid_constant__ Table tab, int begin) {
+__global__ void __launch_bounds__(THREADS, VM_MIN_BLOCKS) k_tiles(const Instr *__restrict__ ins, const __grid_constant__ Table tab, int begin) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ Instr sI;
   __shared__ Tens sT[6];
@@ -783,8 +797,8 @@ __global__ void __launch_bounds__(THREADS, 2) k_tiles(const Instr *__restrict__ 
 void init_attrs() {
   static bool init = false;
   if (init) return;
-  cudaFuncSetAttribute(k_vm, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-  cudaFuncSetAttribute(k_tiles, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  cudaFuncSetAttribute(k_vm, cudaFuncAttributeMaxDynamicSharedMemorySize, VM_SMEM);
+  cudaFuncSetAttribute(k_tiles, cudaFuncAttributeMaxDynamicSharedMemorySize, VM_SMEM);
   init = true;
 }
 
@@ -805,8 +819,26 @@ int64_t vm_grid() {
   int per = 0, sms = 0, dev = 0;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_vm, THREADS, SMEM);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_vm, THREADS, VM_SMEM);
   return (int64_t)per * sms;
+}
+
+pybind11::dict vm_resources() {
+  init_attrs();
+  cudaFuncAttributes attr{};
+  cudaFuncGetAttributes(&attr, k_vm);
+  int per = 0, sms = 0, dev = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_vm, THREADS, VM_SMEM);
+  pybind11::dict d;
+  d["registers_per_thread"] = attr.numRegs;
+  d["local_bytes_per_thread"] = attr.localSizeBytes;
+  d["static_smem_bytes"] = attr.sharedSizeBytes;
+  d["dynamic_smem_bytes"] = VM_SMEM;
+  d["ctas_per_sm"] = per;
+  d["sms"] = sms;
+  return d;
 }
 
 void vm_run(torch::Tensor ins, const std::vector<int64_t> &tt, torch::Tensor deps, torch::Tensor roots, torch::Tensor state, torch::Tensor prof,
@@ -822,8 +854,8 @@ void vm_run(torch::Tensor ins, const std::vector<int64_t> &tt, torch::Tensor dep
   const Instr *ip = reinterpret_cast<const Instr *>(ins.data_ptr());
   int *ctl = state.data_ptr<int>(), *pending = ctl + C_N, *queue = pending + n;
   k_reset<<<(n + 255) / 256, 256, 0, st>>>(ip, roots.data_ptr<int>(), n, nroots, ctl, pending, queue);
-  k_vm<<<(int)grid, THREADS, SMEM, st>>>(ip, table(tt), deps.data_ptr<int>(), (int)nq, ctl, pending, queue,
-                                        prof.numel() ? reinterpret_cast<unsigned long long *>(prof.data_ptr()) : nullptr, (uint64_t)timeout_ns);
+  k_vm<<<(int)grid, THREADS, VM_SMEM, st>>>(ip, table(tt), deps.data_ptr<int>(), (int)nq, ctl, pending, queue,
+                                           prof.numel() ? reinterpret_cast<unsigned long long *>(prof.data_ptr()) : nullptr, (uint64_t)timeout_ns);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -831,13 +863,14 @@ void vm_tiles(torch::Tensor ins, const std::vector<int64_t> &tt, int64_t begin, 
   check_ins(ins);
   TORCH_CHECK(begin >= 0 && count > 0 && begin + count <= ins.size(0), "range");
   init_attrs();
-  k_tiles<<<(int)count, THREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const Instr *>(ins.data_ptr()),
+  k_tiles<<<(int)count, THREADS, VM_SMEM, at::cuda::getCurrentCUDAStream()>>>(reinterpret_cast<const Instr *>(ins.data_ptr()),
                                                                          table(tt), (int)begin);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grid", &vm_grid, "resident persistent CTAs for k_vm");
+  m.def("resources", &vm_resources, "persistent VM register, local-memory, shared-memory and occupancy limits");
   m.def("run", &vm_run, "reset + persistent dependency-counted VM over a tile program");
   m.def("tiles", &vm_tiles, "one launch: instructions [begin, begin+count), one CTA each, no dependency tracking");
 }
