@@ -71,7 +71,8 @@
       "ROPE32": "1",
       "ROPE_KV": "1",
       "XATTN": "1",
-      "ONLY": "n2_calib_rope32,n1n2_rope32"
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1"
     },
     "best_spec": {
       "FUSED_GLUE": "1",
@@ -83,7 +84,8 @@
       "ROPE_KV": "1",
       "XATTN": "1",
       "SPEC": "1",
-      "ONLY": "n2_calib_rope32,n1n2_rope32"
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1"
     },
     "best_graphs": {
       "FUSED_GLUE": "1",
@@ -95,7 +97,8 @@
       "ROPE_KV": "1",
       "XATTN": "1",
       "GRAPHS": "1",
-      "ONLY": "n2_calib_rope32,n1n2_rope32"
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1"
     },
     "stock_graphs": {
       "FREE_BF16_W": "0",
@@ -115,7 +118,8 @@
       "FUSED_FFN": "1",
       "ROPE32": "1",
       "FRAMES": "481",
-      "ONLY": "n2_calib_rope32,n1n2_rope32"
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1"
     }
   }
 }
