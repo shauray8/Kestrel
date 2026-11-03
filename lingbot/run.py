@@ -358,6 +358,11 @@ if os.environ.get("XATTN") == "1":
     from xattn import install as xattn_install
     xattn_install(mf)
 
+ATTN_MASS = None
+if os.environ.get("ATTN_MASS") == "1":
+    from bench.attn_mass import install as attn_mass_install
+    ATTN_MASS = attn_mass_install(pipe, mf, lambda: MODE.get("n2") and not MODE["calib"])
+
 GR = None
 if os.environ.get("GRAPHS"):
     from graphs import Graphs
@@ -402,6 +407,8 @@ if os.environ.get("CALIB_CACHE"):
         print(json.dumps({"exp": "calib_cache", "hit": True, "key": _key}), flush=True)
 for tag, n1, calib, n2 in RUNS:
     MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
+    if ATTN_MASS is not None:
+        ATTN_MASS.begin(tag)
     for m in CAM.get("mods", []):
         m.key, m.val = None, None
     CAM.update(hits=0, miss=0)
