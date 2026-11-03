@@ -22,3 +22,7 @@ def cache_plan(current_start, tokens, old_global, old_local, cache_size, sink_to
     else:
         hi = old_local + end - old_global
     return CachePlan(end, hi, hi - tokens, max(0, hi - max_attention_size), advance)
+
+
+def vm_advance_eligible(advance):
+    return advance is None or all(v % 16 == 0 for v in advance)

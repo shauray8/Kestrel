@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from lingbot.vm_schedule import cache_plan
+from lingbot.vm_schedule import cache_plan, vm_advance_eligible
 
 
 def upstream(start, tokens, global_end, local_end, capacity, sink, maximum, local=True):
@@ -77,6 +77,27 @@ class CacheScheduleTests(unittest.TestCase):
     def test_no_retained_tokens(self):
         p = cache_plan(16, 16, 16, 16, 16, 0, 16)
         self.assertEqual(p, (32, 16, 0, 0, None))
+
+    def test_advance_alignment_classes(self):
+        self.assertTrue(vm_advance_eligible(None))
+        self.assertTrue(vm_advance_eligible((16, 16, 64)))
+        for advance in ((8, 16, 64), (16, 17, 64), (16, 16, 65)):
+            self.assertFalse(vm_advance_eligible(advance))
+
+    def test_unaligned_eviction_then_vm_overwrite(self):
+        for fs in (1560, 1561, 1564):
+            old, paths = (0, 0), set()
+            tokens, capacity, sink = 2 * fs, 18 * fs, 6 * fs
+            for chunk in range(12):
+                for step in range(5):
+                    p = cache_plan(chunk * tokens, tokens, *old, capacity, sink, capacity)
+                    self.assertEqual(p, upstream(chunk * tokens, tokens, *old, capacity, sink, capacity))
+                    eligible = vm_advance_eligible(p.advance)
+                    paths.add("vm" if eligible else "fallback")
+                    if chunk >= 9:
+                        self.assertEqual(eligible, step != 0 or fs == 1560)
+                    old = p.global_end, p.local_end
+            self.assertEqual(paths, {"vm"} if fs == 1560 else {"vm", "fallback"})
 
 
 if __name__ == "__main__":

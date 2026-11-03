@@ -1,11 +1,12 @@
+import json
 import math
 import os
 import numpy as np
 
 import torch
 
-from kestrel import vm
-from lingbot.vm_schedule import cache_plan
+from kestrel import ops, vm
+from lingbot.vm_schedule import cache_plan, vm_advance_eligible
 
 def cross_norm(blk):
     n = blk.norm3
@@ -51,9 +52,11 @@ def block_parts(blk, x, e, ev, context, cross, target, buffers):
 def install(g):
     assert os.environ.get("FUSED_GLUE") == "1" and os.environ.get("FUSED_FFN") == "1"
     assert os.environ.get("ROPE_KV") == "1" and os.environ.get("VM_ATTN") == "1" and os.environ.get("ATTN", "n2") == "n2"
+    ops.vm()
     PATHS, MODE, TARGET, FusedFFN, orig, mf, pipe = (g[k] for k in
         ("PATHS", "MODE", "TARGET", "FusedFFN", "_glue_block_forward", "_mf_glue", "pipe"))
     plans, parts, workspaces, ropetabs, prepared = {}, {}, {}, {}, set()
+    coverage = {}
     active, sample = None, None
     frames = min(int(os.environ.get("FRAMES", "97")), np.load(f'{g["EXAMPLE"]}/poses.npy', mmap_mode="r").shape[0])
     latent_frames = (frames - 1) // pipe.vae_stride[0] + 1
@@ -127,6 +130,13 @@ def install(g):
                         ck = (id(blk), key, p.global_end, p.write_offset, p.lo, p.local_end, p.advance, first, camera)
                         if ck in plans:
                             continue
+                        eligible = vm_advance_eligible(p.advance)
+                        coverage[(M, p.write_offset, p.lo, p.local_end, p.advance)] = {
+                            "tokens": M, "write_offset": p.write_offset, "lo": p.lo, "hi": p.local_end,
+                            "advance": p.advance, "path": "vm" if eligible else "fallback"}
+                        if not eligible:
+                            plans[ck] = None
+                            continue
                         ap, ao = vm.self_attention_program(*bufs[:3], cs, kv["k"].view(-1, C), kv["v"].view(-1, C),
                                                            p.lo, p.local_end, p.write_offset, p.advance,
                                                            blk.self_attn.norm_q.weight.view(1, -1),
@@ -186,10 +196,14 @@ def install(g):
         sample = None
         cs = rope_table(shape, start // fs, raw.device)
         active = key, p, bool(first), camera, cs
+        for cache in caches:
+            cache["_vm_plan"] = p
         try:
             out = inner(**{**kw, "cross_attn_first_call": bool(first), "frame_seqlen": fs})
         finally:
             active = None
+            for cache in caches:
+                cache.pop("_vm_plan", None)
         for kv, cross in zip(caches, crosses):
             kv["_vm_indices"] = (p.global_end, p.local_end)
             cross["_vm_first"] = False
@@ -238,13 +252,14 @@ def install(g):
         external = {c[k].untyped_storage().data_ptr() for caches in (sample["kv_cache"], sample["crossattn_cache"]) for c in caches
                     for k in c if isinstance(c[k], torch.Tensor)}
         for group in plans.values():
-            for program in group:
+            for program in group or ():
                 program.keep = [t for t in program.keep if t is None or t.untyped_storage().data_ptr() not in external]
         for mp, sq, so, groups in parts.values():
             for program in [mp, sq, so, *(p for group in groups for _, p in group)]:
                 program.keep = [t for t in program.keep if t is None or t.untyped_storage().data_ptr() not in external]
         sample = None
-        print(f'{{"exp": "vm_block_warmup", "programs": {sum(map(len, plans.values()))}}}', flush=True)
+        print(json.dumps({"exp": "vm_block_warmup", "programs": sum(len(group) for group in plans.values() if group),
+                          "classes": list(coverage.values())}), flush=True)
 
     g["VM_WARMUP"] = warmup
 
@@ -257,9 +272,13 @@ def install(g):
             return orig(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict, kv_cache, crossattn_cache,
                         current_start, max_attention_size, frame_seqlen, cross_attn_first_call, seq_lens_int)
         key, p, first, camera, cs = active
-        x = x.float().contiguous()
         ck = (id(self), key, p.global_end, p.write_offset, p.lo, p.local_end, p.advance, first, camera)
         programs = plans[ck]
+        if programs is None:
+            PATHS["block_vm_fallback"] += 1
+            return orig(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict, kv_cache, crossattn_cache,
+                        current_start, max_attention_size, frame_seqlen, first, seq_lens_int)
+        x = x.float().contiguous()
         values = {"mod.e": e.reshape(-1, 6 * x.size(-1)), "sq.residual": x.view(-1, x.size(-1)),
                   "sa.cs": cs, "sa.kc": kv_cache["k"].view(-1, x.size(-1)),
                   "sa.vc": kv_cache["v"].view(-1, x.size(-1)),

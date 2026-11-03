@@ -1,11 +1,13 @@
 import json
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import torch
 
-from kestrel import vm
+from kestrel import ops, vm
 from lingbot.vm_block import block_parts
 from lingbot.vm_schedule import cache_plan
+from lingbot.ropekv_hook import install as ropekv_install
 
 
 D, FF, TARGET = 1536, 8960, 16.0
@@ -121,7 +123,40 @@ def case(M, broadcast, camera, rolling, first):
                       "rolling": rolling, "first": first, "blocks": 2, "pass": True}), flush=True)
 
 
+def unaligned_fallback_case():
+    class Attention:
+        num_heads, head_dim, local_attn_size, sink_size = 12, 128, 4, 1
+
+        @staticmethod
+        def forward(q, k, v):
+            return ops.n2().n2_attention(q.half(), k.half(), v.half()).to(BF)
+
+    mf = NS(CausalWanSelfAttention=Attention, attention=Attention.forward)
+    ropekv_install(mf, ops, vm)
+    g = torch.Generator(device="cuda").manual_seed(55)
+    M, capacity = 65, 260
+    q, k, v = [torch.randn(1, M, 12, 128, device="cuda", dtype=BF, generator=g) for _ in range(3)]
+    base = {name: torch.randn(1, capacity, 12, 128, device="cuda", dtype=BF, generator=g) for name in ("k", "v")}
+    base.update({name: torch.tensor([capacity], dtype=torch.int64, device="cuda")
+                 for name in ("global_end_index", "local_end_index")})
+    reference = {name: tensor.clone() for name, tensor in base.items()}
+    managed = {name: tensor.clone() for name, tensor in base.items()}
+    plan = cache_plan(capacity, M, capacity, capacity, capacity, M, capacity)
+    managed["_vm_plan"] = plan
+    angles = torch.arange(128, device="cuda")[:, None].expand(-1, 64).float() * 0.01
+    freqs = torch.polar(torch.ones_like(angles), angles)
+    a = Attention()
+    ref = a.vm_attend(q, k, v, None, (1, 1, M), freqs, reference, capacity, capacity, M)
+    with patch.object(torch.Tensor, "item", side_effect=AssertionError("device index read")):
+        out = a.vm_attend(q, k, v, None, (1, 1, M), freqs, managed, capacity, capacity, M)
+    torch.cuda.synchronize()
+    assert torch.equal(ref, out)
+    assert all(torch.equal(reference[name], managed[name]) for name in reference)
+    print(json.dumps({"test": "vm_unaligned_fallback", "advance": plan.advance, "pass": True}), flush=True)
+
+
 if __name__ == "__main__":
     for args in ((128, True, False, False, True), (128, False, True, True, False),
                  (3120, True, True, False, True), (3120, False, False, True, False)):
         case(*args)
+    unaligned_fallback_case()

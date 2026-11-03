@@ -1,5 +1,6 @@
 import math
 import torch
+from lingbot.vm_schedule import vm_advance_eligible
 
 def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
     ext = ops.rope_kv()
@@ -65,18 +66,27 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
         current_end = current_start + s
         sink_tokens = self.sink_size * frame_seqlen
         cache_size = kv_cache["k"].shape[1]
-        old_global = int(kv_cache["global_end_index"].item())
-        old_local = int(kv_cache["local_end_index"].item())
+        shared = kv_cache.get("_vm_plan")
+        old_global = int(kv_cache["global_end_index"].item()) if shared is None else 0
+        old_local = int(kv_cache["local_end_index"].item()) if shared is None else 0
         advance = None
         use_vm = vm is not None and enabled()
-        if self.local_attn_size == -1:
+        if shared is not None:
+            local_end_index, local_start_index, advance = shared.local_end, shared.write_offset, shared.advance
+            use_vm = use_vm and vm_advance_eligible(advance)
+            if advance is not None and not use_vm:
+                sink, drop, used = advance
+                count = used - drop - sink
+                kv_cache["k"][:, sink:sink + count] = kv_cache["k"][:, sink + drop:sink + drop + count].clone()
+                kv_cache["v"][:, sink:sink + count] = kv_cache["v"][:, sink + drop:sink + drop + count].clone()
+        elif self.local_attn_size == -1:
             local_end_index = current_end
             local_start_index = current_start
         elif current_end > old_global and s + old_local > cache_size:
             num_evicted_tokens = s + old_local - cache_size
             num_rolled_tokens = old_local - num_evicted_tokens - sink_tokens
             advance = (sink_tokens, num_evicted_tokens, old_local) if num_rolled_tokens > 0 else None
-            use_vm = use_vm and (advance is None or all(v % 16 == 0 for v in advance))
+            use_vm = use_vm and vm_advance_eligible(advance)
             if not use_vm:
                 kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
