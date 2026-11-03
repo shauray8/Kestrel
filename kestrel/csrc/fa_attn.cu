@@ -30,6 +30,16 @@ __device__ __forceinline__ void mma(uint32_t (&d)[2], const uint32_t (&a)[4], ui
   asm volatile("mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
                : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void mma_mx(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sb) {
+  asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+               "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%11}, {%12}, {%11,%11};"
+               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(127u), "h"(uint16_t(0)), "r"(sb));
+}
+__device__ __forceinline__ float ceil_pow2(float x) {
+  const uint32_t u = __float_as_uint(x);
+  return __uint_as_float(((u >> 23) + ((u & 0x7FFFFFu) != 0)) << 23);
+}
 __device__ __forceinline__ uint32_t quant2(float x, float y) {
   __nv_fp8x2_e4m3 a(make_float2(x, y));
   return a.__x;
@@ -80,7 +90,7 @@ __device__ __forceinline__ float2 load2(const __nv_bfloat16 *p) { return __bfloa
 
 template <typename In, bool Transpose>
 __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ out, float *__restrict__ scales,
-                                int L, int H, int nb, int first, float target) {
+                                int L, int H, int nb, int first, float target, bool pow2) {
   __shared__ float maxima[8];
   __shared__ uint8_t tile[Transpose ? TILE : 1];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, block = first + blockIdx.x, head = blockIdx.y;
@@ -99,7 +109,7 @@ __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ 
   mx = lane < 8 ? maxima[lane] : 0.f;
 #pragma unroll
   for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
-  const float sc = fmaxf(mx / target, 1.e-12f);
+  const float sc = pow2 ? ceil_pow2(fmaxf(mx / target, 1.e-12f)) : fmaxf(mx / target, 1.e-12f);
   if (!tid) scales[head * nb + block] = sc;
   uint8_t *dst = out + (size_t(head) * nb + block) * TILE;
 #pragma unroll
@@ -121,7 +131,7 @@ __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ 
   }
 }
 
-template <int Load, int Exp, int QTile>
+template <int Load, int Exp, int QTile, bool Mx = false>
 __global__ void __launch_bounds__(QTile * 2 + (Load == 3 ? 32 : 0), QTile == 64 ? 2 : 1)
 fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const uint8_t *__restrict__ V,
           const float *__restrict__ QS, const float *__restrict__ KS, const float *__restrict__ VS,
@@ -279,6 +289,19 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
         o[j][0] *= al0; o[j][1] *= al0; o[j][2] *= al1; o[j][3] *= al1;
       }
     }
+    if constexpr (Mx) {
+      const uint32_t sb = __float_as_uint(sv) >> 23;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          uint32_t b[4];
+          ld4(b, tV + sw64(j * 16 + (mi >> 1) * 8 + r, kk * 2 + (mi & 1)));
+          mma_mx(o[j * 2], pa[kk], b[0], b[1], sb);
+          mma_mx(o[j * 2 + 1], pa[kk], b[2], b[3], sb);
+        }
+      }
+    } else {
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       uint32_t h0[2] = {0, 0}, h1[2] = {0, 0};
@@ -295,6 +318,7 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
       o[j * 2][2] = fmaf(b.x, sv, o[j * 2][2]); o[j * 2][3] = fmaf(b.y, sv, o[j * 2][3]);
       o[j * 2 + 1][0] = fmaf(c.x, sv, o[j * 2 + 1][0]); o[j * 2 + 1][1] = fmaf(c.y, sv, o[j * 2 + 1][1]);
       o[j * 2 + 1][2] = fmaf(d.x, sv, o[j * 2 + 1][2]); o[j * 2 + 1][3] = fmaf(d.y, sv, o[j * 2 + 1][3]);
+    }
     }
     if constexpr (Load == 3) {
       __syncwarp();
@@ -335,23 +359,23 @@ CUtensorMap make_map(const torch::Tensor &x, bool transposed) {
   return map;
 }
 
-template <int Load, int Exp, int QTile>
+template <int Load, int Exp, int QTile, bool Mx = false>
 void launch(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor &v,
             const torch::Tensor &qs, const torch::Tensor &ks, const torch::Tensor &vs,
             torch::Tensor &out, int Lq, int Lk, float scale, float threshold, CUtensorMap km, CUtensorMap vm) {
   constexpr int NT = QTile * 2 + (Load == 3 ? 32 : 0), SMEM = QTile * D + 2 * stages(QTile) * TILE + 64;
   static const bool configured = [] {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(fa_kernel<Load, Exp, QTile>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(fa_kernel<Load, Exp, QTile, Mx>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
     return true;
   }();
   (void)configured;
-  fa_kernel<Load, Exp, QTile><<<dim3((Lq + QTile - 1) / QTile, q.size(0)), NT, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+  fa_kernel<Load, Exp, QTile, Mx><<<dim3((Lq + QTile - 1) / QTile, q.size(0)), NT, SMEM, at::cuda::getCurrentCUDAStream()>>>(
     q.data_ptr<uint8_t>(), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(), qs.data_ptr<float>(), ks.data_ptr<float>(), vs.data_ptr<float>(),
     reinterpret_cast<half *>(out.data_ptr()), Lq, Lk, q.size(0), scale * 1.4426950408889634f, threshold, km, vm);
 }
 }
 
-void fa_quant(torch::Tensor x, torch::Tensor packed, torch::Tensor scales, int start, int stop, bool transpose, double target) {
+void fa_quant(torch::Tensor x, torch::Tensor packed, torch::Tensor scales, int start, int stop, bool transpose, double target, bool pow2) {
   const bool bf = x.scalar_type() == torch::kBFloat16;
   TORCH_CHECK(x.is_cuda() && (bf || x.scalar_type() == torch::kHalf) && x.dim() == 3 && x.size(2) == D && x.is_contiguous(), "x must be contiguous CUDA fp16/bf16 [L,H,128]");
   const c10::cuda::CUDAGuard guard(x.device());
@@ -369,12 +393,12 @@ void fa_quant(torch::Tensor x, torch::Tensor packed, torch::Tensor scales, int s
   float *ps = scales.data_ptr<float>();
   if (bf) {
     auto px = reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr());
-    if (transpose) fa_quant_kernel<__nv_bfloat16, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
-    else fa_quant_kernel<__nv_bfloat16, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+    if (transpose) fa_quant_kernel<__nv_bfloat16, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target, pow2);
+    else fa_quant_kernel<__nv_bfloat16, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target, pow2);
   } else {
     auto px = reinterpret_cast<const half *>(x.data_ptr());
-    if (transpose) fa_quant_kernel<half, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
-    else fa_quant_kernel<half, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target);
+    if (transpose) fa_quant_kernel<half, true><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target, pow2);
+    else fa_quant_kernel<half, false><<<grid, T, 0, st>>>(px, po, ps, L, H, nb, start, target, pow2);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -393,7 +417,7 @@ torch::Tensor fa_plan(torch::Tensor k, torch::Tensor v) {
 
 torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor qs, torch::Tensor ks, torch::Tensor vs,
                             int Lq, int Lk, double sm_scale, int load_mode, int exp_mode, double rescale_threshold,
-                            c10::optional<torch::Tensor> plan, int q_tile) {
+                            c10::optional<torch::Tensor> plan, int q_tile, bool mx) {
   check_packed(q, "q"); check_packed(k, "k"); check_packed(v, "v");
   const c10::cuda::CUDAGuard guard(q.device());
   int H = q.size(0), nq = (Lq + BK - 1) / BK, nk = (Lk + BK - 1) / BK;
@@ -406,6 +430,7 @@ torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, to
   TORCH_CHECK(exp_mode >= 0 && exp_mode <= 2 && std::isfinite(sm_scale) && sm_scale > 0
               && rescale_threshold >= 0 && rescale_threshold <= 0.5, "invalid exp mode, attention scale, or rescale threshold (0..0.5 log2 units)");
   TORCH_CHECK(q_tile == 64 || q_tile == 128, "q_tile must be 64 or 128");
+  TORCH_CHECK(!mx || load_mode == 3, "mx requires load_mode 3");
   CUtensorMap km{}, vm{};
   if (load_mode != 0) {
     torch::Tensor maps = plan.has_value() ? *plan : fa_plan(k, v);
@@ -414,9 +439,9 @@ torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, to
     std::memcpy(&vm, maps.data_ptr<uint8_t>() + sizeof(km), sizeof(vm));
   }
   auto out = torch::empty({Lq, H, D}, q.options().dtype(torch::kHalf));
-#define FA_LAUNCH(L, E) if (q_tile == 64) { launch<L, E, 64>(q, k, v, qs, ks, vs, out, Lq, Lk, sm_scale, rescale_threshold, km, vm); } else { launch<L, E, 128>(q, k, v, qs, ks, vs, out, Lq, Lk, sm_scale, rescale_threshold, km, vm); }
-#define FA_EXP(L) if (exp_mode == 0) { FA_LAUNCH(L, 0); } else if (exp_mode == 1) { FA_LAUNCH(L, 1); } else { FA_LAUNCH(L, 2); }
-  if (load_mode == 0) { FA_EXP(0); } else if (load_mode == 1) { FA_EXP(1); } else { FA_EXP(3); }
+#define FA_LAUNCH(L, E, M) if (q_tile == 64) { launch<L, E, 64, M>(q, k, v, qs, ks, vs, out, Lq, Lk, sm_scale, rescale_threshold, km, vm); } else { launch<L, E, 128, M>(q, k, v, qs, ks, vs, out, Lq, Lk, sm_scale, rescale_threshold, km, vm); }
+#define FA_EXP(L, M) if (exp_mode == 0) { FA_LAUNCH(L, 0, M); } else if (exp_mode == 1) { FA_LAUNCH(L, 1, M); } else { FA_LAUNCH(L, 2, M); }
+  if (mx) { FA_EXP(3, true); } else if (load_mode == 0) { FA_EXP(0, false); } else if (load_mode == 1) { FA_EXP(1, false); } else { FA_EXP(3, false); }
 #undef FA_EXP
 #undef FA_LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -424,10 +449,11 @@ torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, to
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("fa_quant", &fa_quant);
+  m.def("fa_quant", &fa_quant, pybind11::arg("x"), pybind11::arg("packed"), pybind11::arg("scales"), pybind11::arg("start"),
+        pybind11::arg("stop"), pybind11::arg("transpose"), pybind11::arg("target"), pybind11::arg("pow2") = false);
   m.def("fa_plan", &fa_plan);
   m.def("fa_attention", &fa_attention, pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("qs"), pybind11::arg("ks"), pybind11::arg("vs"), pybind11::arg("Lq"), pybind11::arg("Lk"),
         pybind11::arg("sm_scale"), pybind11::arg("load_mode"), pybind11::arg("exp_mode"), pybind11::arg("rescale_threshold"),
-        pybind11::arg("plan") = pybind11::none(), pybind11::arg("q_tile") = 128);
+        pybind11::arg("plan") = pybind11::none(), pybind11::arg("q_tile") = 128, pybind11::arg("mx") = false);
 }

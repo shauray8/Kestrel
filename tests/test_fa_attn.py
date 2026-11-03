@@ -173,6 +173,25 @@ def test_query_tile_parity(mode):
     print(json.dumps({"kind": "fa_query_tile", "mode": mode, "rel_64_128": parity, "rel_64_fp32": error}), flush=True)
     assert parity <= KERNEL_REL and error <= QUANT_REL + KERNEL_REL
 
+@pytest.mark.parametrize("exp_mode", (0, 1, 2))
+@pytest.mark.parametrize("tile", (64, 128))
+@pytest.mark.parametrize("lq,lk", ((33, 64), (65, 129), (129, 385), (3120, 9360)))
+def test_mx_pv(exp_mode, tile, lq, lk):
+    ext = ops.fa()
+    q, k, v = tensors(lq, lk)
+    (q8, qs), (k8, ks), (v8, vs) = pack(ext, q), pack(ext, k), pack(ext, v, True, 1)
+    vm8, vms = torch.empty_like(v8), torch.empty_like(vs)
+    ext.fa_quant(v, vm8, vms, 0, vms.shape[1], True, 448, True)
+    assert torch.equal(vms, torch.exp2(torch.log2(vms).round()))
+    base = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, ext.fa_plan(k8, v8), tile, False)
+    mx = ext.fa_attention(q8, k8, vm8, qs, ks, vms, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, ext.fa_plan(k8, vm8), tile, True)
+    integrated = FAttention(mode="fp8", load_mode=3, exp_mode=exp_mode, rescale_threshold=0.5, q_tile=tile, mx=True)
+    assert torch.equal(mx, integrated(0, q[None], k[None], v[None])[0])
+    ref = reference(q, k, v)
+    err_mx, err_base = relative(mx, ref), relative(base, ref)
+    print(json.dumps({"kind": "fa_mx", "lq": lq, "lk": lk, "tile": tile, "exp_mode": exp_mode, "rel_mx": err_mx, "rel_base": err_base}), flush=True)
+    assert torch.isfinite(mx).all() and err_mx <= err_base * 1.05 + 1e-3
+
 @pytest.mark.parametrize("mode", MODES)
 def test_nondefault_stream(mode):
     ops.fa()

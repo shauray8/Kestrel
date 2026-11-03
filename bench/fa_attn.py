@@ -78,10 +78,13 @@ def main():
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--allow-missing-sage", action="store_true")
     ap.add_argument("--json", type=Path, help="also write all result records as a JSON array")
+    ap.add_argument("--mx", default="0", help="comma-separated 0,1; 1 = MXFP8 block-scaled P.V with FP32 accumulation (load-mode 3)")
     args = ap.parse_args()
     try:
-        modes = list(itertools.product(numbers(args.load_mode, int, (0, 1, 3)), numbers(args.exp_mode, int, (0, 1, 2)),
-                                       numbers(args.rescale_threshold, float), numbers(args.q_tile, int, (64, 128))))
+        modes = [m for m in itertools.product(numbers(args.load_mode, int, (0, 1, 3)), numbers(args.exp_mode, int, (0, 1, 2)),
+                                              numbers(args.rescale_threshold, float), numbers(args.q_tile, int, (64, 128)),
+                                              numbers(args.mx, int, (0, 1)))
+                 if not m[4] or m[0] == 3]
     except ValueError as exc:
         ap.error(str(exc))
     if any(mode[2] > 0.5 for mode in modes):
@@ -143,20 +146,22 @@ def main():
                 if nr:
                     row.update(reference_queries=nr, rel_fp32=relative(output[:nr], ref))
                 emit(row)
-            buffers = (packed_buffers(q), packed_buffers(k), packed_buffers(v, True))
-            def quantize():
-                for i, (x, (packed, scales)) in enumerate(zip((q, k, v), buffers)):
-                    ext.fa_quant(x, packed, scales, 0, (x.shape[0] + 63) // 64, i == 2, 1 if i == 2 else 8)
-            quantize()
-            (q8, qs), (k8, ks), (v8, vs) = buffers
+            buffers = (packed_buffers(q), packed_buffers(k), packed_buffers(v, True), packed_buffers(v, True))
+            def quantize(mx):
+                for i, (x, (packed, scales)) in enumerate(zip((q, k, v), (buffers[0], buffers[1], buffers[3 if mx else 2]))):
+                    ext.fa_quant(x, packed, scales, 0, (x.shape[0] + 63) // 64, i == 2, (448 if mx else 1) if i == 2 else 8, mx and i == 2)
+            quantize(False)
+            quantize(True)
+            (q8, qs), (k8, ks) = buffers[:2]
             for mode in modes:
+                v8, vs = buffers[3 if mode[4] else 2]
                 plan = ext.fa_plan(k8, v8) if mode[0] in (1, 3) else None
                 def cached():
-                    return ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, *mode[:3], plan, mode[3])
+                    return ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, *mode[:3], plan, mode[3], bool(mode[4]))
                 def inclusive():
-                    quantize()
+                    quantize(bool(mode[4]))
                     return cached()
-                fa = FAttention(mode="fp8", load_mode=mode[0], exp_mode=mode[1], rescale_threshold=mode[2], q_tile=mode[3])
+                fa = FAttention(mode="fp8", load_mode=mode[0], exp_mode=mode[1], rescale_threshold=mode[2], q_tile=mode[3], mx=mode[4])
                 fa(0, q[None], k[None], v[None])
                 methods = {"fa_cached": cached, "fa_quant_inclusive": inclusive,
                            "fa_history_cached": lambda: fa(0, q[None], k[None], v[None])[0]}
@@ -170,7 +175,7 @@ def main():
                     ms = timing(fn, args.warmup, args.iters, args.graph)
                     tops = flops / ms / 1e9
                     emit({"kind": "fa_speed", **base, "method": method, "load_mode": mode[0], "exp_mode": mode[1],
-                          "rescale_threshold": mode[2], "q_tile": mode[3], "ms": ms, "tops": tops, "percent_peak": 100 * tops / 1016,
+                          "rescale_threshold": mode[2], "q_tile": mode[3], "mx": mode[4], "ms": ms, "tops": tops, "percent_peak": 100 * tops / 1016,
                           "speedup_n2": baseline_ms["n2_fp16"] / ms,
                           **({"speedup_sage2": baseline_ms["sage2"] / ms} if "sage2" in baseline_ms else {}), **accuracy})
     if not count:
