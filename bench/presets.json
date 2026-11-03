@@ -92,7 +92,8 @@
       "RMS_ROPE": "1",
       "GLUE2": "1",
       "FA_MX": "1",
-      "FA_BAL": "1"
+      "FA_BAL": "1",
+      "N3_CONT": "1"
     },
     "best_spec": {
       "FUSED_GLUE": "1",
