@@ -174,7 +174,7 @@ def test_query_tile_parity(mode):
     assert parity <= KERNEL_REL and error <= QUANT_REL + KERNEL_REL
 
 @pytest.mark.parametrize("exp_mode", (0, 1, 2))
-@pytest.mark.parametrize("lq,lk", ((33, 64), (65, 129), (129, 385), (3120, 9360)))
+@pytest.mark.parametrize("lq,lk", ((33, 64), (129, 65), (129, 385), (3120, 9360)))
 def test_pipe_bit_exact(exp_mode, lq, lk):
     ext = ops.fa()
     q, k, v = tensors(lq, lk)
