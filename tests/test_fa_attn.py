@@ -207,19 +207,19 @@ def test_bal(exp_mode, mx, lq, lk, h):
     out_bal = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, mx, True)
     out_base = ext.fa_attention(q8, k8, v8, qs, ks, vs, lq, lk, 128 ** -0.5, 3, exp_mode, 0.5, plan, 128, mx, False)
     assert torch.isfinite(out_bal).all() and torch.isfinite(out_base).all()
-    parity = relative(out_bal, out_base)
-    identical = float((out_bal == out_base).reshape(lq, -1).all(dim=1).float().mean())
-    assert parity < 1e-3
-    if (lq + 127) // 128 * h < 170:
-        assert torch.equal(out_bal, out_base)
-    else:
-        assert identical > 0.5
+    units, nk, sms = (lq + 127) // 128 * h, (lk + 63) // 64, torch.cuda.get_device_properties(0).multi_processor_count
+    split = {b // nk for b in (c * units * nk // sms for c in range(1, sms)) if b % nk} if units >= sms else set()
+    for u in range(units):
+        head, q0 = u // ((lq + 127) // 128), u % ((lq + 127) // 128) * 128
+        same = torch.equal(out_bal[q0:q0 + 128, head], out_base[q0:q0 + 128, head])
+        assert same != (u in split), (u, same)
+    ref = reference(q, k, v)
+    err_bal, err_base = relative(out_bal, ref), relative(out_base, ref)
+    assert err_bal <= err_base * 1.05 + 1e-3
     integrated = FAttention(mode="fp8", load_mode=3, exp_mode=exp_mode, rescale_threshold=0.5, q_tile=128, mx=mx, bal=True)
     assert torch.equal(out_bal, integrated(0, q[None], k[None], v[None])[0])
-    ref = reference(q, k, v)
-    print(json.dumps({"kind": "fa_bal", "lq": lq, "lk": lk, "h": h, "exp_mode": exp_mode, "mx": mx,
-                      "rel_bal_base": parity, "identical_rows": identical, "rel_bal_fp32": relative(out_bal, ref),
-                      "rel_base_fp32": relative(out_base, ref)}), flush=True)
+    print(json.dumps({"kind": "fa_bal", "lq": lq, "lk": lk, "h": h, "exp_mode": exp_mode, "mx": mx, "split_units": len(split),
+                      "units": units, "rel_bal_fp32": err_bal, "rel_base_fp32": err_base}), flush=True)
 
 @pytest.mark.parametrize("mode", MODES)
 def test_nondefault_stream(mode):
