@@ -251,11 +251,19 @@ if ATTN_IMPL == "kvq":
 import wan.modules.model_fast as mf
 ext2 = ops.n2()
 _orig_attention = mf.attention
+AB = None
+if ATTN_IMPL == "ab":
+    from ab_hook import ABAttention
+    AB = ABAttention(pipe.model, ext2, PATHS)
 
 def n2_attention(q, k, v, *a, **kw):
     if not MODE.get("n2") or ATTN_IMPL == "sdpa" or q.shape[0] != 1 or q.shape[-1] != 128 or a or kw:
         PATHS["attn_stock_" + ("off" if not MODE.get("n2") else "args" if a or kw else "sdpa" if ATTN_IMPL == "sdpa" else "shape")] += 1
         return _orig_attention(q, k, v, *a, **kw)
+    if AB is not None:
+        out = AB.attend(q, k, v)
+        if out is not None:
+            return out.to(q.dtype)
     if ATTN_IMPL == "kvq" and k.shape[1] > q.shape[1]:
         PATHS["attn_kvq"] += 1
         layer = KVQ_STATE["layer"]; KVQ_STATE["layer"] += 1
@@ -387,6 +395,8 @@ def after_calib():
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
     _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "XATTN")
+    if AB is not None:
+        _keys += ("AB_SPARSITY", "AB_DENSE_STEPS", "AB_DENSE_BLOCKS", "AB_PLAN_CYCLE", "AB_CLUSTERS", "AB_SEED", "AB_KEEP_SINK", "AB_KEEP_CURRENT")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):
@@ -398,6 +408,8 @@ if os.environ.get("CALIB_CACHE"):
         print(json.dumps({"exp": "calib_cache", "hit": True, "key": _key}), flush=True)
 for tag, n1, calib, n2 in RUNS:
     MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
+    if AB is not None:
+        AB.reset()
     for m in CAM.get("mods", []):
         m.key, m.val = None, None
     CAM.update(hits=0, miss=0)

@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -27,14 +29,23 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
   return *reinterpret_cast<uint32_t *>(&h);
 }
 
-template <bool HSM>
+template <bool HSM, int SB = 0>
 __global__ void __launch_bounds__(THREADS, 1) n2_attn(const half *__restrict__ Q, const half *__restrict__ K, const half *__restrict__ V,
-                                                      half *__restrict__ O, int Lq, int Lk, int H, float scale_log2) {
+                                                      half *__restrict__ O, int Lq, int Lk, int H, float scale_log2,
+                                                      const int *__restrict__ indices = nullptr, const float *__restrict__ bias = nullptr, int samples = 0) {
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t *sQ = smem, *sK = smem + BQ * ROWB, *sV = sK + 2 * BKV * ROWB;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.y, q0 = blockIdx.x * BQ;
   const size_t tok = (size_t)H * D;
   const half *Qh = Q + head * D, *Kh = K + head * D, *Vh = V + head * D;
+  const size_t plan_row = ((size_t)head * gridDim.x + blockIdx.x) * samples;
+  auto key_at = [&](int pos) {
+    if constexpr (SB > 0) {
+      const int slot = pos / SB;
+      const int id = slot < samples ? indices[plan_row + slot] : -1;
+      return id < 0 ? -1 : id * SB + pos % SB;
+    } else return pos;
+  };
 
 #pragma unroll
   for (int i = 0; i < BQ * 16 / THREADS; i++) {
@@ -44,8 +55,9 @@ __global__ void __launch_bounds__(THREADS, 1) n2_attn(const half *__restrict__ Q
   auto load_kv = [&](int buf, int kb) {
 #pragma unroll
     for (int i = 0; i < BKV * 16 / THREADS; i++) {
-      int c = tid + i * THREADS, row = c >> 4, ch = c & 15, gk = kb * BKV + row;
+      int c = tid + i * THREADS, row = c >> 4, ch = c & 15, gk = key_at(kb * BKV + row);
       bool p = gk < Lk;
+      if constexpr (SB > 0) p = p && gk >= 0;
       size_t off = (size_t)(p ? gk : 0) * tok + ch * 8;
       cp_async16(smem_u32(sK + buf * BKV * ROWB + swz(row, ch)), Kh + off, p);
       cp_async16(smem_u32(sV + buf * BKV * ROWB + swz(row, ch)), Vh + off, p);
@@ -78,8 +90,9 @@ __global__ void __launch_bounds__(THREADS, 1) n2_attn(const half *__restrict__ Q
   for (int j = 0; j < 16; j++) o[j][0] = o[j][1] = o[j][2] = o[j][3] = 0.f;
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
 
-  const int nkb = (Lk + BKV - 1) / BKV;
+  const int nkb = SB > 0 ? (samples * SB + BKV - 1) / BKV : (Lk + BKV - 1) / BKV;
   for (int kb = 0; kb < nkb; kb++) {
+    if constexpr (SB > 0) { if (key_at(kb * BKV) < 0) break; }
     const int buf = kb & 1;
     if (kb + 1 < nkb) load_kv(buf ^ 1, kb + 1);
     asm volatile("cp.async.commit_group;");
@@ -102,7 +115,24 @@ __global__ void __launch_bounds__(THREADS, 1) n2_attn(const half *__restrict__ Q
     uint32_t pa[4][4];
     if constexpr (HSM) {
 
-      if (kb * BKV + BKV > Lk) {
+      if constexpr (SB > 0) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const int pos = kb * BKV + j * 8 + t4 * 2;
+          const int key0 = key_at(pos), key1 = key_at(pos + 1);
+          const __half ninf = __ushort_as_half(0xFC00);
+          __half2 *a = reinterpret_cast<__half2 *>(&s[j][0]), *b = reinterpret_cast<__half2 *>(&s[j][1]);
+          if (key0 < 0 || key0 >= Lk) { a->x = ninf; b->x = ninf; }
+          if (key1 < 0 || key1 >= Lk) { a->y = ninf; b->y = ninf; }
+          if (key0 >= 0 && key0 < Lk) {
+            const float shift = bias[plan_row + pos / SB];
+            if (shift != 0.f) {
+              const __half2 hshift = __float2half2_rn(shift);
+              *a = __hadd2(*a, hshift); *b = __hadd2(*b, hshift);
+            }
+          }
+        }
+      } else if (kb * BKV + BKV > Lk) {
 #pragma unroll
         for (int j = 0; j < 8; j++) {
           const int key = kb * BKV + j * 8 + t4 * 2;
@@ -397,8 +427,40 @@ torch::Tensor n2_attention_v2(torch::Tensor q, torch::Tensor k, torch::Tensor v)
   return o;
 }
 
+template <int SB>
+torch::Tensor n2_sparse_run(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor indices, torch::Tensor bias) {
+  const c10::cuda::CUDAGuard guard(q.device());
+  const int Lq = q.size(0), H = q.size(1), Lk = k.size(0), samples = indices.size(2);
+  auto o = torch::empty_like(q);
+  constexpr int smem = BQ * ROWB + 4 * BKV * ROWB;
+  static bool init = false;
+  if (!init) { C10_CUDA_CHECK(cudaFuncSetAttribute(n2_attn<true, SB>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem)); init = true; }
+  dim3 grid((Lq + BQ - 1) / BQ, H);
+  n2_attn<true, SB><<<grid, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half *>(q.data_ptr()), reinterpret_cast<const half *>(k.data_ptr()), reinterpret_cast<const half *>(v.data_ptr()),
+      reinterpret_cast<half *>(o.data_ptr()), Lq, Lk, H, float(1.4426950408889634 / std::sqrt((double)D)),
+      indices.data_ptr<int>(), bias.data_ptr<float>(), samples);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return o;
+}
+
+torch::Tensor n2_attention_sparse(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor indices, torch::Tensor bias, int selection_block) {
+  TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && indices.is_cuda() && bias.is_cuda(), "CUDA tensors required");
+  TORCH_CHECK(q.device() == k.device() && q.device() == v.device() && q.device() == indices.device() && q.device() == bias.device(), "devices must match");
+  TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.sizes() == k.sizes(), "expected Q/K/V [tokens,heads,128]");
+  TORCH_CHECK(q.scalar_type() == torch::kHalf && k.scalar_type() == torch::kHalf && v.scalar_type() == torch::kHalf, "FP16 Q/K/V required");
+  TORCH_CHECK(q.size(0) > 0 && k.size(0) > 0 && q.size(1) > 0 && q.size(1) == k.size(1) && q.size(2) == D && k.size(2) == D, "invalid attention shape");
+  TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && indices.is_contiguous() && bias.is_contiguous(), "contiguous tensors required");
+  TORCH_CHECK(indices.scalar_type() == torch::kInt32 && bias.scalar_type() == torch::kFloat32 && indices.dim() == 3 && indices.sizes() == bias.sizes(), "indices int32 and log_bias float32 must match [heads,query_blocks,samples]");
+  TORCH_CHECK(indices.size(0) == q.size(1) && indices.size(1) == (q.size(0) + BQ - 1) / BQ && indices.size(2) > 0, "invalid plan shape");
+  TORCH_CHECK(selection_block == 4 || selection_block == 64, "selection_block must be 4 or 64");
+  return selection_block == 4 ? n2_sparse_run<4>(q, k, v, indices, bias) : n2_sparse_run<64>(q, k, v, indices, bias);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("n2_attention", &n2_attention, "FP16 ladder attention, packed-FP16 softmax (non-causal, D=128)");
+  m.def("n2_attention_sparse", &n2_attention_sparse, pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("indices"), pybind11::arg("log_bias"), pybind11::arg("selection_block") = 4);
   m.def("n2_attention_v0", &n2_attention_v0, "v0: FP32 softmax");
   m.def("n2_attention_v2", &n2_attention_v2, "v2: 32 query rows per warp, 4 warps");
 }
