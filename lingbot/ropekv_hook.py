@@ -4,7 +4,7 @@ import torch
 def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
     ext = ops.rope_kv()
     original = mf.CausalWanSelfAttention.forward
-    cache, programs = {}, {}
+    cache, programs, ends = {}, {}, {}
 
     def tables(x, grid_sizes, freqs, start_frame):
         n, c = x.size(2), x.size(3) // 2
@@ -65,8 +65,11 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
         current_end = current_start + s
         sink_tokens = self.sink_size * frame_seqlen
         cache_size = kv_cache["k"].shape[1]
-        old_global = int(kv_cache["global_end_index"].item())
-        old_local = int(kv_cache["local_end_index"].item())
+        key = (id(kv_cache["global_end_index"]), kv_cache["k"].data_ptr())
+        old = ends.get(key)
+        if old is None:
+            old = ends[key] = (int(kv_cache["global_end_index"].item()), int(kv_cache["local_end_index"].item()))
+        old_global, old_local = old
         advance = None
         use_vm = vm is not None and enabled()
         if self.local_attn_size == -1:
@@ -99,6 +102,7 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             out = mf.attention(roped_query, kv_cache["k"][:, lo:local_end_index], kv_cache["v"][:, lo:local_end_index])
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
+        ends[key] = (current_end, local_end_index)
         return out
 
     def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
@@ -110,9 +114,11 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
         out = attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
                      frame_seqlen, seq_lens_int)
         if out is None:
+            ends.clear()
             return original(self, x, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
                             frame_seqlen, seq_lens_int)
         return self.o(out.flatten(2))
 
     mf.CausalWanSelfAttention.vm_attend = attend
     mf.CausalWanSelfAttention.forward = forward
+    return ends.clear

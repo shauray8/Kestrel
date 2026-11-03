@@ -360,14 +360,15 @@ if os.environ.get("ROPE32") == "1":
     mf.causal_rope_apply = rope32
     RUNS_OVERRIDE = [(t + "_rope32", a, b, c) for t, a, b, c in (RUNS_OVERRIDE or [("n2_calib", False, True, True), ("n1n2", True, False, True)])]
 
+KV_RESET = lambda: None
 if os.environ.get("ROPE_KV") == "1":
     from ropekv_hook import install as ropekv_install
     if os.environ.get("VM_ATTN") == "1":
         assert ATTN_IMPL == "n2", "VM_ATTN=1 requires ATTN=n2"
         from kestrel import vm as vm_runtime
-        ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"))
+        KV_RESET = ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"))
     else:
-        ropekv_install(mf, ops)
+        KV_RESET = ropekv_install(mf, ops)
 if os.environ.get("XATTN") == "1":
     from xattn import install as xattn_install
     xattn_install(mf)
@@ -448,6 +449,7 @@ for tag, n1, calib, n2 in RUNS:
             pipe.model.forward, pipe.vae.decode = _forward_profiled, _decode_unprofiled
         else:
             prof.__enter__()
+    KV_RESET()
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
     generate_fn = pipe.generate
