@@ -1,4 +1,5 @@
 import math
+import os
 import struct
 from functools import cache
 
@@ -10,6 +11,8 @@ HALT, GEMM_F8, GEMM_F8_GELU, MOD_NORM, RESIDUAL_MOD_NORM, GEMM_F8_GATED_RES, JOI
 OPS = ("halt", "gemm_f8", "gemm_f8_gelu", "mod_norm", "residual_mod_norm", "gemm_f8_gated_res", "join", "rope_kv_append", "kv_advance", "attn_window", "quantize", "rms_norm", "gated_residual", "cache_commit", "modulate")
 ERRORS = ("ok", "timeout", "opcode", "overflow")
 BM, BN, RB, AQ, MAXT = 128, 128, 8, 64, 96
+if int(os.environ.get("VM_ATTN_PERF", "96" if os.environ.get("VM_BLOCK") == "1" else "0")):
+    AQ = 128
 _DT = {torch.float8_e4m3fn: 0, torch.bfloat16: 1, torch.float32: 2, torch.int64: 3, torch.int32: 4}
 
 def _cdiv(a, b):

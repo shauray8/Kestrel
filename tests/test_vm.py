@@ -1,4 +1,4 @@
-import json, math, sys, time
+import json, math, os, sys, time
 import torch
 import torch.nn.functional as F
 from kestrel import ops, vm
@@ -177,8 +177,19 @@ def attn_window_case(Lq=127, Lk=193, H=4):
     g = torch.Generator(device="cuda").manual_seed(6)
     q = torch.randn(Lq, H * 128, device="cuda", dtype=BF, generator=g)
     k, v = (torch.randn(Lk, H * 128, device="cuda", dtype=BF, generator=g) for _ in range(2))
-    ref = n2.n2_attention(q.view(1, Lq, H, 128).half(), k.view(1, Lk, H, 128).half(),
-                          v.view(1, Lk, H, 128).half()).to(BF).view_as(q)
+    qh, kh, vh = (t.view(1, t.size(0), H, 128).half() for t in (q, k, v))
+    saved = os.environ.get("N2_ATTN_SHARED")
+    try:
+        os.environ["N2_ATTN_SHARED"] = "0"
+        refh = n2.n2_attention(qh, kh, vh)
+        os.environ["N2_ATTN_SHARED"] = "1"
+        shared = n2.n2_attention(qh, kh, vh)
+    finally:
+        if saved is None:
+            os.environ.pop("N2_ATTN_SHARED", None)
+        else:
+            os.environ["N2_ATTN_SHARED"] = saved
+    ref = refh.to(BF).view_as(q)
     out = torch.empty_like(q)
     p = vm.Program()
     qi, ki, vi, oi = (p.tensor(t) for t in (q, k, v, out))
@@ -188,8 +199,8 @@ def attn_window_case(Lq=127, Lk=193, H=4):
     torch.cuda.synchronize()
     st = p.status()
     r = {"test": "vm_attn_window", "Lq": Lq, "Lk": Lk, "H": H, **st,
-         "mismatch_vs_n2": diff(out, ref), "rel_vs_n2": rel(out, ref)}
-    r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["mismatch_vs_n2"] == 0
+         "mismatch_vs_n2": diff(out, ref), "rel_vs_n2": rel(out, ref), "shared_mismatch_vs_n2": diff(shared, refh)}
+    r["pass"] = st["err"] == "ok" and st["done"] == st["n"] and r["mismatch_vs_n2"] == r["shared_mismatch_vs_n2"] == 0
     emit(r)
     return r["pass"]
 
@@ -284,10 +295,13 @@ def cycle_case(M=3120, timeout_ms=50.0):
     return r["pass"]
 
 if __name__ == "__main__":
+    if "--attn-only" in sys.argv:
+        res = [attn_window_case(), attn_window_case(129, 65, 1), attn_window_case(3120, 28080, 12)]
+        sys.exit(0 if all(res) else 1)
     res = [ffn_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True), rope_kv_case(), kv_advance_case(),
-            attn_window_case(), block_ops_case()]
+            attn_window_case(), attn_window_case(129, 65, 1), attn_window_case(3120, 28080, 12), block_ops_case()]
     res.append(cycle_case())
     emit({"test": "vm_all", "pass": all(res), "n": len(res)})
     sys.exit(0 if all(res) else 1)

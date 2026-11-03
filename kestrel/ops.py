@@ -9,7 +9,12 @@ os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.g
 
 @cache
 def _ext(name):
-    return load(f"kestrel_{name}", [os.path.join(_CSRC, f"{name}.cu")], extra_cuda_cflags=_FLAGS, verbose=False)
+    mode = int(os.environ.get("VM_ATTN_PERF", "96" if os.environ.get("VM_BLOCK") == "1" else "0")) if name == "vm" else 0
+    if mode not in (0, 48, 96):
+        raise ValueError("VM_ATTN_PERF must be 0, 48, or 96")
+    flags = _FLAGS + ([f"-DVM_ATTN_PERF={mode}"] if mode else [])
+    return load(f"kestrel_{name}" + (f"_attn{mode}" if mode else ""), [os.path.join(_CSRC, f"{name}.cu")],
+                extra_cuda_cflags=flags, verbose=False)
 
 def n1():
     return _ext("n1_linear")

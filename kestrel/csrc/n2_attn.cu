@@ -2,6 +2,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include "attn_window.cuh"
 
 namespace {
 constexpr int D = 128, BQ = 128, BKV = 64, WARPS = 8, THREADS = WARPS * 32;
@@ -209,6 +212,11 @@ __global__ void __launch_bounds__(THREADS, 1) n2_attn(const half *__restrict__ Q
     if (row1 < Lq) *reinterpret_cast<__half2 *>(Oh + (size_t)row1 * tok + col) = __floats2half2_rn(o[j][2] * i1, o[j][3] * i1);
   }
 }
+__global__ void __launch_bounds__(THREADS, 1) n2_attn_shared(const half *__restrict__ Q, const half *__restrict__ K, const half *__restrict__ V,
+                                                          half *__restrict__ O, int Lq, int Lk, int H, float scale_log2) {
+  extern __shared__ __align__(128) uint8_t smem[];
+  kestrel_attn::run<false, true>(Q, K, V, O, Lq, Lk, H, blockIdx.x * BQ, blockIdx.y, scale_log2, smem);
+}
 
 constexpr int W2 = 4, T2 = W2 * 32;
 __global__ void __launch_bounds__(T2, 1) n2_attn2(const half *__restrict__ Q, const half *__restrict__ K, const half *__restrict__ V,
@@ -376,6 +384,18 @@ torch::Tensor n2_run(torch::Tensor q, torch::Tensor k, torch::Tensor v) {
   static bool init = false;
   if (!init) { cudaFuncSetAttribute(n2_attn<HSM>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); init = true; }
   dim3 grid((Lq + BQ - 1) / BQ, H);
+  if constexpr (HSM) {
+    const char *shared = std::getenv("N2_ATTN_SHARED");
+    if (shared && std::strcmp(shared, "1") == 0) {
+      static bool init_shared = false;
+      if (!init_shared) { cudaFuncSetAttribute(n2_attn_shared, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); init_shared = true; }
+      n2_attn_shared<<<grid, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const half *>(q.data_ptr()), reinterpret_cast<const half *>(k.data_ptr()), reinterpret_cast<const half *>(v.data_ptr()),
+          reinterpret_cast<half *>(o.data_ptr()), Lq, Lk, H, float(1.4426950408889634 / std::sqrt((double)D)));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return o;
+    }
+  }
   n2_attn<HSM><<<grid, THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half *>(q.data_ptr()), reinterpret_cast<const half *>(k.data_ptr()), reinterpret_cast<const half *>(v.data_ptr()),
       reinterpret_cast<half *>(o.data_ptr()), Lq, Lk, H, float(1.4426950408889634 / std::sqrt((double)D)));
