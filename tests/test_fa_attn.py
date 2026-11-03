@@ -211,9 +211,9 @@ def test_nondefault_stream(mode):
 class QuantTrace:
     def __init__(self, ext):
         self.ext, self.calls = ext, []
-    def fa_quant(self, x, packed, scales, start, stop, transpose, target):
+    def fa_quant(self, x, packed, scales, start, stop, transpose, target, pow2=False):
         self.calls.append((x.data_ptr(), start, stop, transpose, target))
-        return self.ext.fa_quant(x, packed, scales, start, stop, transpose, target)
+        return self.ext.fa_quant(x, packed, scales, start, stop, transpose, target, pow2)
     def __getattr__(self, name):
         return getattr(self.ext, name)
 
