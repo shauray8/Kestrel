@@ -1,7 +1,7 @@
 import math
 import torch
 
-def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
+def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False):
     ext = ops.rope_kv()
     original = mf.CausalWanSelfAttention.forward
     cache, programs, ends = {}, {}, {}
@@ -96,9 +96,15 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             nk = self.norm_k.weight.view(1, -1).contiguous() if norm_in_vm else None
             out = run_vm(q, k, v, cs, kv_cache["k"], kv_cache["v"], local_start_index, lo, local_end_index, advance, nq, nk, self.eps)
         else:
-            if norm_in_vm:
-                q, k = self.norm_q(q.flatten(2)).view_as(q), self.norm_k(k.flatten(2)).view_as(k)
-            roped_query = ext.rope_qk_append(q, k, v, cos, sin, kv_cache["k"], kv_cache["v"], local_start_index)
+            if norm_in_vm and self.norm_q.weight.dtype == torch.bfloat16 and self.norm_k.weight.dtype == torch.bfloat16:
+                roped_query = ext.rms_rope_qk_append(q, k, v, self.norm_q.weight, self.norm_k.weight, self.norm_q.eps, cos, sin,
+                                                     kv_cache["k"], kv_cache["v"], local_start_index)
+                if paths is not None:
+                    paths["rms_rope_fused"] += 1
+            else:
+                if norm_in_vm:
+                    q, k = self.norm_q(q.flatten(2)).view_as(q), self.norm_k(k.flatten(2)).view_as(k)
+                roped_query = ext.rope_qk_append(q, k, v, cos, sin, kv_cache["k"], kv_cache["v"], local_start_index)
             out = mf.attention(roped_query, kv_cache["k"][:, lo:local_end_index], kv_cache["v"][:, lo:local_end_index])
         kv_cache["global_end_index"].fill_(current_end)
         kv_cache["local_end_index"].fill_(local_end_index)
@@ -108,11 +114,13 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
     def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
                 frame_seqlen=None, seq_lens_int=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        if fused_norm:
+            q, k = self.q(x).view(b, s, n, d), self.k(x).view(b, s, n, d)
+        else:
+            q, k = self.norm_q(self.q(x)).view(b, s, n, d), self.norm_k(self.k(x)).view(b, s, n, d)
         v = self.v(x).view(b, s, n, d)
         out = attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
-                     frame_seqlen, seq_lens_int)
+                     frame_seqlen, seq_lens_int, fused_norm)
         if out is None:
             ends.clear()
             return original(self, x, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,

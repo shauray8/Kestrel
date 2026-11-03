@@ -248,6 +248,7 @@ if ATTN_IMPL == "kvq":
 if ATTN_IMPL == "fa":
     from kestrel.fa import FAttention
     FA = FAttention()
+    ops.fa()
 if ATTN_IMPL in ("kvq", "fa"):
     ATTN_STATE = {"layer": 0, "start": None}
     _orig_model_fwd = pipe.model.forward
@@ -366,9 +367,9 @@ if os.environ.get("ROPE_KV") == "1":
     if os.environ.get("VM_ATTN") == "1":
         assert ATTN_IMPL == "n2", "VM_ATTN=1 requires ATTN=n2"
         from kestrel import vm as vm_runtime
-        KV_RESET = ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"))
+        KV_RESET = ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"), fused_norm=os.environ.get("RMS_ROPE") == "1")
     else:
-        KV_RESET = ropekv_install(mf, ops)
+        KV_RESET = ropekv_install(mf, ops, paths=PATHS, fused_norm=os.environ.get("RMS_ROPE") == "1")
 if os.environ.get("XATTN") == "1":
     from xattn import install as xattn_install
     xattn_install(mf)
@@ -405,7 +406,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE")
     if ATTN_IMPL == "fa":
         _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]

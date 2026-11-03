@@ -84,6 +84,32 @@ def timing():
         print(json.dumps({"kind": "timing", "cache": "l2_flushed" if cold else "hot", "torch_us": ref_us,
                           "fused_us": fused_us, "speedup": ref_us / fused_us}), flush=True)
 
+def rms(x, w, eps=1e-6):
+    xf = x.float().flatten(2)
+    return ((xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)).type_as(x) * w).view_as(x)
+
+def check_rms(start_frame, offset):
+    torch.manual_seed(2000 + start_frame)
+    q, k, v = (torch.randn(B, L, H, D, device="cuda", dtype=torch.bfloat16) * 3 for _ in range(3))
+    wq, wk = ((torch.rand(H * D, device="cuda") + 0.5).bfloat16() for _ in range(2))
+    kc0 = torch.randn(B, C, H, D, device="cuda", dtype=torch.bfloat16)
+    vc0 = torch.randn(B, C, H, D, device="cuda", dtype=torch.bfloat16)
+    kc1, vc1, kc2, vc2 = kc0.clone(), vc0.clone(), kc0.clone(), vc0.clone()
+    cos, sin = tables(start_frame)
+    qr = ext.rope_qk_append(rms(q, wq), rms(k, wk), v, cos, sin, kc1, vc1, offset)
+    qo = ext.rms_rope_qk_append(q, k, v, wq, wk, 1e-6, cos, sin, kc2, vc2, offset)
+    eq, ek = errors(qo, qr), errors(kc2, kc1)
+    ok = eq["max_rel"] <= 2 ** -7 and ek["max_rel"] <= 2 ** -7 and torch.equal(vc1, vc2)
+    print(json.dumps({"kind": "rms_correctness", "start_frame": start_frame, "write_offset": offset, "q": eq, "k": ek,
+                      "v_equal": bool(torch.equal(vc1, vc2)), "pass": ok}), flush=True)
+    assert ok
+    t = lambda: (rms(q, wq), rms(k, wk))
+    a = bench(lambda: ext.rope_qk_append(*t(), v, cos, sin, kc1, vc1, offset), 50, False)
+    b = bench(lambda: ext.rms_rope_qk_append(q, k, v, wq, wk, 1e-6, cos, sin, kc2, vc2, offset), 50, False)
+    print(json.dumps({"kind": "rms_timing", "torch_norm_plus_rope_us": a, "fused_us": b, "speedup": a / b}), flush=True)
+
 for sf, off in ((0, 0), (6, 9360), (18, 24960), (18, 18720)):
     check(sf, off)
+for sf, off in ((0, 0), (18, 24960)):
+    check_rms(sf, off)
 timing()
