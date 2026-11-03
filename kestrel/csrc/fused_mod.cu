@@ -34,9 +34,9 @@ __device__ __forceinline__ float warp_sum(float s) {
   return s;
 }
 
-template <int NIT, bool RES, int OUT>
+template <int NIT, bool RES, int OUT, bool CAM = false, bool AFF = false>
 __global__ void __launch_bounds__(kWarps * 32) fused_mod_kernel(float *__restrict__ x, const __nv_bfloat16 *__restrict__ y,
-                                                                ModArg gate, ModArg shift, ModArg scale,
+                                                                ModArg gate, ModArg shift, ModArg scale, ModArg aux,
                                                                 void *__restrict__ out, int M, float eps, float inv_scale) {
   constexpr int C = NIT * 256;
   const int lane = threadIdx.x & 31;
@@ -47,7 +47,19 @@ __global__ void __launch_bounds__(kWarps * 32) fused_mod_kernel(float *__restric
 #pragma unroll
   for (int j = 0; j < NIT; ++j) load8(xr + j * 256, v[j]);
 
-  if constexpr (RES) {
+  if constexpr (CAM) {
+    const float *ar = gate.p + (size_t)(m / gate.rows_per) * gate.stride + lane * 8;
+    const float *tr = aux.p + (size_t)(m / aux.rows_per) * aux.stride + lane * 8;
+#pragma unroll
+    for (int j = 0; j < NIT; ++j) {
+      float a[8], t[8];
+      ldg8(ar + j * 256, a);
+      ldg8(tr + j * 256, t);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) v[j][k] = __fadd_rn(__fmul_rn(a[k], v[j][k]), t[k]);
+      store8(xr + j * 256, v[j]);
+    }
+  } else if constexpr (RES) {
     const __nv_bfloat16 *yr = y + (size_t)m * C + lane * 8;
     const float *gr = gate.p ? gate.p + (size_t)(m / gate.rows_per) * gate.stride + lane * 8 : nullptr;
 #pragma unroll
@@ -97,7 +109,8 @@ __global__ void __launch_bounds__(kWarps * 32) fused_mod_kernel(float *__restric
       ldg8(scr + j * 256, sc);
 #pragma unroll
       for (int k = 0; k < 8; ++k)
-        o[k] = __fadd_rn(__fmul_rn(__fmul_rn(v[j][k] - mean, rstd), __fadd_rn(1.f, sc[k])), sh[k]);
+        o[k] = AFF ? __fadd_rn(__fmul_rn(__fmul_rn(v[j][k] - mean, rstd), sc[k]), sh[k])
+                   : __fadd_rn(__fmul_rn(__fmul_rn(v[j][k] - mean, rstd), __fadd_rn(1.f, sc[k])), sh[k]);
       const size_t off = (size_t)m * C + j * 256 + lane * 8;
       if constexpr (OUT == OUT_BF16) {
         uint4 pk;
@@ -120,6 +133,43 @@ __global__ void __launch_bounds__(kWarps * 32) fused_mod_kernel(float *__restric
   }
 }
 
+template <int NIT>
+__global__ void __launch_bounds__(kWarps * 32) rms_bf16_kernel(const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ w,
+                                                               __nv_bfloat16 *__restrict__ out, int M, float eps) {
+  constexpr int C = NIT * 256;
+  const int lane = threadIdx.x & 31;
+  const int m = blockIdx.x * kWarps + (threadIdx.x >> 5);
+  if (m >= M) return;
+  float v[NIT][8];
+  float s = 0.f;
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    const uint4 raw = *reinterpret_cast<const uint4 *>(x + (size_t)m * C + j * 256 + lane * 8);
+    const __nv_bfloat162 *h = reinterpret_cast<const __nv_bfloat162 *>(&raw);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 f = __bfloat1622float2(h[k]);
+      v[j][2 * k] = f.x; v[j][2 * k + 1] = f.y;
+      s = fmaf(f.x, f.x, s);
+      s = fmaf(f.y, f.y, s);
+    }
+  }
+  const float r = rsqrtf(__fadd_rn(__fdiv_rn(warp_sum(s), (float)C), eps));
+#pragma unroll
+  for (int j = 0; j < NIT; ++j) {
+    const uint4 wr = __ldg(reinterpret_cast<const uint4 *>(w + j * 256 + lane * 8));
+    const __nv_bfloat162 *g = reinterpret_cast<const __nv_bfloat162 *>(&wr);
+    uint4 pk;
+    __nv_bfloat162 *h = reinterpret_cast<__nv_bfloat162 *>(&pk);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float2 gf = __bfloat1622float2(g[k]);
+      h[k] = __floats2bfloat162_rn(__fmul_rn(__fmul_rn(v[j][2 * k], r), gf.x), __fmul_rn(__fmul_rn(v[j][2 * k + 1], r), gf.y));
+    }
+    *reinterpret_cast<uint4 *>(out + (size_t)m * C + j * 256 + lane * 8) = pk;
+  }
+}
+
 ModArg mod_arg(const c10::optional<torch::Tensor> &t, int64_t C, int64_t M, const char *name) {
   if (!t.has_value()) return {nullptr, 0, 1};
   const auto &a = *t;
@@ -137,14 +187,14 @@ ModArg mod_arg(const c10::optional<torch::Tensor> &t, int64_t C, int64_t M, cons
   return {a.data_ptr<float>(), R == 1 ? 0 : stride, (int)(M / R)};
 }
 
-template <bool RES, int OUT>
+template <bool RES, int OUT, bool CAM = false, bool AFF = false>
 void launch(torch::Tensor &x, const __nv_bfloat16 *y, ModArg gate, ModArg shift, ModArg scale, void *out, int64_t C, int64_t M,
-            double eps, float inv_s) {
+            double eps, float inv_s, ModArg aux = {nullptr, 0, 1}) {
   const dim3 grid((unsigned)((M + kWarps - 1) / kWarps)), block(kWarps * 32);
   auto st = at::cuda::getCurrentCUDAStream();
   float *xp = x.data_ptr<float>();
 #define FM_CASE(N) \
-  case N: fused_mod_kernel<N, RES, OUT><<<grid, block, 0, st>>>(xp, y, gate, shift, scale, out, (int)M, (float)eps, inv_s); break;
+  case N: fused_mod_kernel<N, RES, OUT, CAM, AFF><<<grid, block, 0, st>>>(xp, y, gate, shift, scale, aux, out, (int)M, (float)eps, inv_s); break;
   switch (C / 256) {
     FM_CASE(4) FM_CASE(6) FM_CASE(8) FM_CASE(12) FM_CASE(16) FM_CASE(20)
     default: TORCH_CHECK(false, "unsupported C=", C, " (supported: 1024, 1536, 2048, 3072, 4096, 5120)");
@@ -219,6 +269,39 @@ torch::Tensor residual_then_mod_norm_fp8(torch::Tensor x, torch::Tensor y, c10::
   return run_norm<true>(x, check_y(x, y), mod_arg(gate, C, M, "gate"), shift, scale, eps, torch::kFloat8_e4m3fn, s);
 }
 
+torch::Tensor cam_ln(torch::Tensor x, c10::optional<torch::Tensor> a, c10::optional<torch::Tensor> t, torch::Tensor w,
+                     torch::Tensor b, double eps) {
+  const auto [C, M] = check_x(x);
+  TORCH_CHECK(a.has_value() == t.has_value(), "a and t must both be given or both be None");
+  auto out = torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
+  const ModArg wa = mod_arg(w, C, M, "w"), ba = mod_arg(b, C, M, "b");
+  if (a.has_value())
+    launch<false, OUT_BF16, true, true>(x, nullptr, mod_arg(a, C, M, "a"), ba, wa, out.data_ptr(), C, M, eps, 1.0, mod_arg(t, C, M, "t"));
+  else
+    launch<false, OUT_BF16, false, true>(x, nullptr, ModArg{nullptr, 0, 1}, ba, wa, out.data_ptr(), C, M, eps, 1.0);
+  return out;
+}
+
+torch::Tensor rms_bf16(torch::Tensor x, torch::Tensor w, double eps) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.is_contiguous(), "x must be contiguous CUDA bf16");
+  const int64_t C = x.size(-1), M = x.numel() / C;
+  TORCH_CHECK(C % 256 == 0 && M < (1ll << 31), "C must be a multiple of 256");
+  TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kBFloat16 && w.is_contiguous() && w.numel() == C, "w must be CUDA bf16 [C]");
+  auto out = torch::empty_like(x);
+  const dim3 grid((unsigned)((M + kWarps - 1) / kWarps)), block(kWarps * 32);
+  auto st = at::cuda::getCurrentCUDAStream();
+  auto xp = reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr()), wp = reinterpret_cast<const __nv_bfloat16 *>(w.data_ptr());
+  auto op = reinterpret_cast<__nv_bfloat16 *>(out.data_ptr());
+#define RB_CASE(N) case N: rms_bf16_kernel<N><<<grid, block, 0, st>>>(xp, wp, op, (int)M, (float)eps); break;
+  switch (C / 256) {
+    RB_CASE(4) RB_CASE(6) RB_CASE(8) RB_CASE(12) RB_CASE(16) RB_CASE(20)
+    default: TORCH_CHECK(false, "unsupported C=", C);
+  }
+#undef RB_CASE
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mod_norm", &mod_norm, "LayerNorm(x, no affine) * (1 + scale) + shift -> bf16 (or fp32)", py::arg("x"), py::arg("shift"),
         py::arg("scale"), py::arg("eps") = 1e-6, py::arg("out_dtype") = py::none());
@@ -231,4 +314,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("out_dtype") = py::none());
   m.def("residual_then_mod_norm_fp8", &residual_then_mod_norm_fp8, "x += y * gate in place, then mod_norm(x) -> e4m3 sat(v / s)",
         py::arg("x"), py::arg("y"), py::arg("gate"), py::arg("shift"), py::arg("scale"), py::arg("eps"), py::arg("s"));
+  m.def("cam_ln", &cam_ln, "x = a * x + t in place (if given), then LayerNorm(x) * w + b -> bf16", py::arg("x"), py::arg("a"),
+        py::arg("t"), py::arg("w"), py::arg("b"), py::arg("eps"));
+  m.def("rms_bf16", &rms_bf16, "bf16(x * rsqrt(mean(x^2) + eps) * w) with fp32 intermediate", py::arg("x"), py::arg("w"),
+        py::arg("eps"));
 }

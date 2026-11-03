@@ -192,6 +192,43 @@ if os.environ.get("CAM_HOIST") == "1":
 if os.environ.get("FUSED_GLUE") == "1":
     fmod = ops.fused_mod()
     import wan.modules.model_fast as _mf_glue
+    GLUE2 = os.environ.get("GLUE2") == "1"
+
+    def _cam_at(self, emb, current_start):
+        key = (current_start, id(emb), emb.data_ptr())
+        if getattr(self, "_g2cam", (None,))[0] != key:
+            h = self.cam_injector_layer2(torch.nn.functional.silu(self.cam_injector_layer1(emb))) + emb
+            self._g2cam = (key, (1.0 + self.cam_scale_layer(h)).float().contiguous(), self.cam_shift_layer(h).float().contiguous())
+        return self._g2cam[1:]
+
+    def _g2_ln(self):
+        if getattr(self, "_g2ln", None) is None:
+            n = self.norm3
+            self._g2ln = (n.weight.float().contiguous(), n.bias.float().contiguous(), n.eps) \
+                if isinstance(n, nn.LayerNorm) and n.weight is not None and n.bias is not None else False
+        return self._g2ln
+
+    _orig_xattn = _mf_glue.WanCrossAttention.forward
+
+    def _g2_xattn_forward(self, x, context, context_lens, crossattn_cache=None, cross_attn_first_call=None):
+        if x.dtype != torch.bfloat16 or getattr(self.norm_q, "weight", None) is None or self.norm_q.weight.dtype != torch.bfloat16:
+            return _orig_xattn(self, x, context, context_lens, crossattn_cache, cross_attn_first_call)
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+        q = fmod.rms_bf16(self.q(x).contiguous(), self.norm_q.weight, self.norm_q.eps).view(b, -1, n, d)
+        if crossattn_cache is not None:
+            first = crossattn_cache["is_init"].item() == 0 if cross_attn_first_call is None else cross_attn_first_call
+            if first:
+                crossattn_cache["is_init"].fill_(1)
+                crossattn_cache["k"].copy_(self.norm_k(self.k(context)).view(b, -1, n, d))
+                crossattn_cache["v"].copy_(self.v(context).view(b, -1, n, d))
+            k, v = crossattn_cache["k"], crossattn_cache["v"]
+        else:
+            k, v = self.norm_k(self.k(context)).view(b, -1, n, d), self.v(context).view(b, -1, n, d)
+        PATHS["xattn_glue2"] += 1
+        return self.o(_mf_glue.flash_attention(q, k, v, k_lens=context_lens).flatten(2))
+
+    if GLUE2:
+        _mf_glue.WanCrossAttention.forward = _g2_xattn_forward
 
     def _glue_block_forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens, dit_cond_dict=None, kv_cache=None,
                             crossattn_cache=None, current_start=0, max_attention_size=1_000_000, frame_seqlen=None,
@@ -207,14 +244,20 @@ if os.environ.get("FUSED_GLUE") == "1":
                            seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
                            frame_seqlen=frame_seqlen, seq_lens_int=seq_lens_int)
         fmod.gated_residual(x2, y.reshape(B * L, C).to(torch.bfloat16).contiguous(), ev[2].contiguous())
+        ln = _g2_ln(self) if GLUE2 else False
+        a = t = None
         if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            h = self.cam_injector_layer2(torch.nn.functional.silu(self.cam_injector_layer1(c2ws_plucker_emb)))
-            h = h + c2ws_plucker_emb
-            x = (1.0 + self.cam_scale_layer(h)) * x + self.cam_shift_layer(h)
-            x = x.float().contiguous()
-            x2 = x.view(B * L, C)
-        ca = self.cross_attn(self.norm3(x), context, context_lens, crossattn_cache=crossattn_cache,
+            if ln:
+                a, t = _cam_at(self, dit_cond_dict["c2ws_plucker_emb"], current_start)
+            else:
+                c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
+                h = self.cam_injector_layer2(torch.nn.functional.silu(self.cam_injector_layer1(c2ws_plucker_emb)))
+                h = h + c2ws_plucker_emb
+                x = (1.0 + self.cam_scale_layer(h)) * x + self.cam_shift_layer(h)
+                x = x.float().contiguous()
+                x2 = x.view(B * L, C)
+        xn = fmod.cam_ln(x2, a, t, ln[0], ln[1], ln[2]).view(B, L, C) if ln else self.norm3(x)
+        ca = self.cross_attn(xn, context, context_lens, crossattn_cache=crossattn_cache,
                              cross_attn_first_call=cross_attn_first_call)
         if (os.environ.get("FP8_GLUE") == "1" and isinstance(self.ffn, FusedFFN) and MODE["n1"] and
                 self.ffn.l0.ok and self.ffn.l2.ok and self.ffn.l0.amax > 0 and self.ffn.l2.amax > 0):
@@ -406,7 +449,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE", "GLUE2")
     if ATTN_IMPL == "fa":
         _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]

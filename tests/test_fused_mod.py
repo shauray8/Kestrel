@@ -174,9 +174,44 @@ def timing(M, use_compile):
     row("mod_norm->fp8", lambda: ref_fp8(ref_modnorm32(x, shc, scc), s), lambda: ext.mod_norm_fp8(x, sh, sc, EPS, s),
         MB * 4 + MB)
 
+def bf_ulp_err(a, b):
+    a, b = a.float(), b.float()
+    u = torch.maximum(ulp(torch.maximum(a.abs(), b.abs()), 7), torch.full_like(a, 2.0 ** -126))
+    return float(((a - b).abs() / u).max())
+
+def check_glue2(M):
+    x, _, sh, sc, _ = make(M, M, seed=3)
+    s, t = (sc * 0.3).to(BF), (sh * 2).to(BF)
+    w, b = (torch.rand(C, device="cuda") + 0.5).to(BF), (torch.randn(C, device="cuda") * 0.1).to(BF)
+    xr = (1.0 + s) * x + t
+    ref = F.layer_norm(xr, (C,), w.float(), b.float(), EPS).to(BF)
+    xk = x.clone()
+    a32, t32, w32, b32 = (1.0 + s).float(), t.float(), w.float(), b.float()
+    out = ext.cam_ln(xk, a32, t32, w32, b32, EPS)
+    x_exact = bool(torch.equal(xk, xr))
+    ln_err, ln_mis = bf_ulp_err(out, ref), int((out != ref).sum())
+    out2 = ext.cam_ln(xr.clone(), None, None, w32, b32, EPS)
+    q = (torch.randn(M, C, device="cuda") * 4).to(BF)
+    qf = q.float()
+    rref = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS) * w).to(BF)
+    rout = ext.rms_bf16(q, w, EPS)
+    rms_err, rms_mis = bf_ulp_err(rout, rref), int((rout != rref).sum())
+    ok = x_exact and ln_err <= 1 and rms_err <= 1 and ln_mis < 1e-3 * out.numel() and rms_mis < 1e-3 * out.numel() \
+        and bool(torch.equal(out2, out))
+    torch_cam = lambda: F.layer_norm((1.0 + s) * x + t, (C,), w.float(), b.float(), EPS).to(BF)
+    torch_rms = lambda: (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS) * w).to(BF)
+    res = {"kind": "glue2", "M": M, "cam_x_bit_exact": x_exact, "ln_max_ulp": ln_err, "ln_mismatch": ln_mis,
+           "rms_max_ulp": rms_err, "rms_mismatch": rms_mis, "pass": ok,
+           "cam_ln_torch_us": bench(torch_cam), "cam_ln_us": bench(lambda: ext.cam_ln(xk, a32, t32, w32, b32, EPS)),
+           "rms_torch_us": bench(torch_rms), "rms_us": bench(lambda: ext.rms_bf16(q, w, EPS))}
+    print(json.dumps(res), flush=True)
+    assert ok
+
 if __name__ == "__main__":
     if "--no-check" not in sys.argv:
         for M, R in [(3120, 1), (4680, 1), (4680, 3), (3120, 3120)]:
             check(M, R)
+        for M in (3120, 4680):
+            check_glue2(M)
     for M in (3120, 4680):
         timing(M, "--compile" in sys.argv)
