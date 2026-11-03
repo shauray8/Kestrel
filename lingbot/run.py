@@ -406,14 +406,29 @@ if os.environ.get("ROPE32") == "1":
     RUNS_OVERRIDE = [(t + "_rope32", a, b, c) for t, a, b, c in (RUNS_OVERRIDE or [("n2_calib", False, True, True), ("n1n2", True, False, True)])]
 
 KV_RESET = lambda: None
+
+def _qkv(self, x):
+    ls = (self.q, self.k, self.v)
+    if not (N3 and MODE["n1"] and x.dtype == torch.bfloat16 and all(isinstance(l, N1Linear) and l.ok and l.amax > 0 for l in ls)
+            and ls[0].amax == ls[1].amax == ls[2].amax and len({l.bias_bf16 is None for l in ls}) == 1):
+        return None
+    st = getattr(self, "_qkv_cat", None)
+    if st is None or st[0] != ls[0].amax:
+        bias = None if ls[0].bias_bf16 is None else torch.cat([l.bias_bf16 for l in ls]).contiguous()
+        st = self._qkv_cat = (ls[0].amax, torch.cat([l.wq for l in ls]).contiguous(), torch.cat([l.sw for l in ls]).contiguous(), bias)
+    PATHS["qkv_fused"] += 1
+    y = linear_ext.n3_linear_split(x.contiguous(), st[1], st[2], st[3], st[0] / TARGET, ls[0].lin.out_features)
+    return y[0], y[1], y[2]
+
 if os.environ.get("ROPE_KV") == "1":
     from ropekv_hook import install as ropekv_install
+    _fuse = _qkv if os.environ.get("QKV_FUSE") == "1" else None
     if os.environ.get("VM_ATTN") == "1":
         assert ATTN_IMPL == "n2", "VM_ATTN=1 requires ATTN=n2"
         from kestrel import vm as vm_runtime
-        KV_RESET = ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"), fused_norm=os.environ.get("RMS_ROPE") == "1")
+        KV_RESET = ropekv_install(mf, ops, vm_runtime, PATHS, lambda: MODE.get("n2"), fused_norm=os.environ.get("RMS_ROPE") == "1", qkv=_fuse)
     else:
-        KV_RESET = ropekv_install(mf, ops, paths=PATHS, fused_norm=os.environ.get("RMS_ROPE") == "1")
+        KV_RESET = ropekv_install(mf, ops, paths=PATHS, fused_norm=os.environ.get("RMS_ROPE") == "1", qkv=_fuse)
 if os.environ.get("XATTN") == "1":
     from xattn import install as xattn_install
     xattn_install(mf)

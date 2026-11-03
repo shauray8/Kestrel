@@ -1,7 +1,7 @@
 import math
 import torch
 
-def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False):
+def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False, qkv=None):
     ext = ops.rope_kv()
     original = mf.CausalWanSelfAttention.forward
     cache, programs, ends = {}, {}, {}
@@ -114,11 +114,13 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False
     def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
                 frame_seqlen=None, seq_lens_int=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        if fused_norm:
-            q, k = self.q(x).view(b, s, n, d), self.k(x).view(b, s, n, d)
+        fused = qkv(self, x) if qkv is not None else None
+        if fused is not None:
+            q, k, v = (t.view(b, s, n, d) for t in fused)
         else:
-            q, k = self.norm_q(self.q(x)).view(b, s, n, d), self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+            q, k, v = self.q(x).view(b, s, n, d), self.k(x).view(b, s, n, d), self.v(x).view(b, s, n, d)
+        if not fused_norm:
+            q, k = self.norm_q(q.flatten(2)).view(b, s, n, d), self.norm_k(k.flatten(2)).view(b, s, n, d)
         out = attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache, current_start, max_attention_size,
                      frame_seqlen, seq_lens_int, fused_norm)
         if out is None:

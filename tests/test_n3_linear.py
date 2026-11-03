@@ -68,6 +68,20 @@ def main():
                 same(actual, expected)
                 print(json.dumps({"shape": [m, n, k], "bias": biased, "op": "residual_bf16" if index == 0 else "residual_f8",
                                   "gate_rows": None if g is None else g.shape[0], "bitwise": True, "graph": True}), flush=True)
+    for m, biased in itertools.product((3120, 129, 512), (False, True)):
+        x = (torch.randn(m, 1536, device="cuda") * 1.3).bfloat16()
+        parts = []
+        for _ in range(3):
+            w = torch.randn(1536, 1536, device="cuda") * 0.03
+            sw = w.abs().amax(1).float() / 448.0
+            parts.append(((w / sw[:, None]).to(torch.float8_e4m3fn).contiguous(), sw,
+                          (torch.randn(1536, device="cuda") * 0.1).bfloat16() if biased else None))
+        cat = [torch.cat([p[i] for p in parts]).contiguous() if parts[0][i] is not None else None for i in range(3)]
+        planes = n3.n3_linear_split(x, cat[0], cat[1], cat[2], 0.375, 1536)
+        assert planes.shape == (3, m, 1536)
+        for i, (w, sw, b) in enumerate(parts):
+            same(planes[i], n3.n3_linear(x, w, sw, b, 0.375))
+        print(json.dumps({"shape": [m, 4608, 1536], "bias": biased, "op": "split", "bitwise": True}), flush=True)
 
 
 if __name__ == "__main__":

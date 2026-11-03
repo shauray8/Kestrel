@@ -71,7 +71,7 @@ __device__ __forceinline__ void residual_pair(float *out, size_t off, float a, f
 template <int S, int EPI, bool Cont>
 __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, const __grid_constant__ CUtensorMap bmap,
                                      const float *__restrict__ sw, const __nv_bfloat16 *__restrict__ bias,
-                                     void *__restrict__ out, int M, int N, int K, float sa, float out_inv, Gate gate) {
+                                     void *__restrict__ out, int M, int N, int K, float sa, float out_inv, Gate gate, int split) {
   extern __shared__ __align__(1024) uint8_t smem[];
   uint8_t *sA = smem, *sB = smem + S * AB;
   uint64_t *full = reinterpret_cast<uint64_t *>(smem + S * (AB + BB));
@@ -155,8 +155,9 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
         const float v2 = f[i][j][2] * s0 + b0, v3 = f[i][j][3] * s1 + b1;
         if constexpr (EPI == 0) {
           auto y = reinterpret_cast<__nv_bfloat16 *>(out);
-          if (row < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)row * N + col) = __floats2bfloat162_rn(v0, v1);
-          if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)(row + 8) * N + col) = __floats2bfloat162_rn(v2, v3);
+          auto at = [&](int rr) { return split ? (size_t)(col / split) * M * split + (size_t)rr * split + col % split : (size_t)rr * N + col; };
+          if (row < M) *reinterpret_cast<__nv_bfloat162 *>(y + at(row)) = __floats2bfloat162_rn(v0, v1);
+          if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(y + at(row + 8)) = __floats2bfloat162_rn(v2, v3);
         } else if constexpr (EPI == 1) {
           auto y = reinterpret_cast<uint8_t *>(out);
           if (row < M) *reinterpret_cast<uint16_t *>(y + (size_t)row * N + col) = q2(gelu(v0), gelu(v1), out_inv);
@@ -242,7 +243,7 @@ CUtensorMap encode(const torch::Tensor &x, int rows, int k) {
 
 template <int S, int EPI, bool Cont>
 void launch(CUtensorMap a, CUtensorMap b, const torch::Tensor &sw, const __nv_bfloat16 *bias, torch::Tensor &y,
-            int m, int n, int k, float sa, float inv, Gate gate) {
+            int m, int n, int k, float sa, float inv, Gate gate, int split) {
   constexpr int bytes = S * (AB + BB) + 2 * S * sizeof(uint64_t);
   static thread_local int initialized_device = -1;
   if (initialized_device != sw.get_device()) {
@@ -252,7 +253,7 @@ void launch(CUtensorMap a, CUtensorMap b, const torch::Tensor &sw, const __nv_bf
   const int tiles = ((m + BM - 1) / BM) * (n / BN);
   const int blocks = std::min(tiles, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
   gemm<S, EPI, Cont><<<blocks, THREADS, bytes, at::cuda::getCurrentCUDAStream()>>>(a, b, sw.data_ptr<float>(), bias,
-      y.data_ptr(), m, n, k, sa, inv, gate);
+      y.data_ptr(), m, n, k, sa, inv, gate, split);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -274,7 +275,7 @@ Gate gate_arg(const c10::optional<torch::Tensor> &gate, const torch::Tensor &x, 
 template <bool BF16, int EPI>
 torch::Tensor run(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> bias, double sa,
                   double out_scale, c10::optional<torch::Tensor> residual = c10::nullopt,
-                  c10::optional<torch::Tensor> gate = c10::nullopt) {
+                  c10::optional<torch::Tensor> gate = c10::nullopt, int split = 0) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() >= 1 && x.scalar_type() == (BF16 ? torch::kBFloat16 : torch::kFloat8_e4m3fn), "x");
   const c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(w.device() == x.device() && w.dim() == 2 && w.is_contiguous() && w.scalar_type() == torch::kFloat8_e4m3fn, "w");
@@ -295,6 +296,9 @@ torch::Tensor run(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optio
     TORCH_CHECK(residual && residual->device() == x.device() && residual->scalar_type() == torch::kFloat32 && residual->is_contiguous() && residual->sizes() == at::IntArrayRef(sizes), "residual");
     y = *residual;
     g = gate_arg(gate, x, m, n);
+  } else if (split) {
+    TORCH_CHECK(EPI == 0 && split % BN == 0 && n % split == 0, "split");
+    y = torch::empty({n / split, m, split}, x.options().dtype(torch::kBFloat16));
   } else y = torch::empty(sizes, x.options().dtype(EPI == 1 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
   if (!m) return y;
   torch::Tensor a = x;
@@ -310,9 +314,9 @@ torch::Tensor run(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optio
   const bool c = cont && std::atoi(cont) == 1;
   TORCH_CHECK(s >= 4 && s <= 6, "N3_STAGES must be 4, 5, or 6");
   const float sf = float(sa), inv = float(1.0 / out_scale);
-  if (s == 4) c ? launch<4, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<4, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
-  else if (s == 5) c ? launch<5, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<5, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
-  else c ? launch<6, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<6, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
+  if (s == 4) c ? launch<4, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<4, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
+  else if (s == 5) c ? launch<5, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<5, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
+  else c ? launch<6, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<6, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
   return y;
 }
 
@@ -322,6 +326,7 @@ torch::Tensor linear_f8(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10:
 torch::Tensor linear_f8_gelu(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, double so) { return run<false, 1>(x, w, sw, b, sa, so); }
 torch::Tensor linear_residual(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, torch::Tensor residual, c10::optional<torch::Tensor> gate) { return run<true, 2>(x, w, sw, b, sa, 1.0, residual, gate); }
 torch::Tensor linear_f8_residual(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, torch::Tensor residual, c10::optional<torch::Tensor> gate) { return run<false, 2>(x, w, sw, b, sa, 1.0, residual, gate); }
+torch::Tensor linear_split(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, int64_t split) { return run<true, 0>(x, w, sw, b, sa, 1.0, c10::nullopt, c10::nullopt, int(split)); }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -331,4 +336,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("n3_linear_f8in_gelu_f8", &linear_f8_gelu);
   m.def("n3_linear_residual", &linear_residual);
   m.def("n3_linear_f8in_residual", &linear_f8_residual);
+  m.def("n3_linear_split", &linear_split);
 }
