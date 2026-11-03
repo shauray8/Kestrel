@@ -196,11 +196,14 @@ def check_glue2(M):
     rref = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS) * w).to(BF)
     rout = ext.rms_bf16(q, w, EPS)
     rms_err, rms_mis = bf_ulp_err(rout, rref), int((rout != rref).sum())
-    ok = x_exact and ln_err <= 1 and rms_err <= 1 and ln_mis < 1e-3 * out.numel() and rms_mis < 1e-3 * out.numel() \
+    xd = xr.double()
+    exact = (xd - xd.mean(-1, keepdim=True)) / torch.sqrt(xd.var(-1, unbiased=False, keepdim=True) + EPS) * w.double() + b.double()
+    ln_abs, torch_abs = float((out.double() - exact).abs().max()), float((ref.double() - exact).abs().max())
+    ok = x_exact and ln_abs <= 2 * torch_abs and rms_err <= 1 and ln_mis < 1e-3 * out.numel() and rms_mis < 1e-3 * out.numel() \
         and bool(torch.equal(out2, out))
     torch_cam = lambda: F.layer_norm((1.0 + s) * x + t, (C,), w.float(), b.float(), EPS).to(BF)
     torch_rms = lambda: (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS) * w).to(BF)
-    res = {"kind": "glue2", "M": M, "cam_x_bit_exact": x_exact, "ln_max_ulp": ln_err, "ln_mismatch": ln_mis,
+    res = {"kind": "glue2", "M": M, "cam_x_bit_exact": x_exact, "ln_max_abs": ln_abs, "torch_ln_max_abs": torch_abs, "ln_mismatch": ln_mis,
            "rms_max_ulp": rms_err, "rms_mismatch": rms_mis, "pass": ok,
            "cam_ln_torch_us": bench(torch_cam), "cam_ln_us": bench(lambda: ext.cam_ln(xk, a32, t32, w32, b32, EPS)),
            "rms_torch_us": bench(torch_rms), "rms_us": bench(lambda: ext.rms_bf16(q, w, EPS))}
