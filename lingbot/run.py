@@ -21,6 +21,12 @@ from generate import _parse_args, _init_logging
 from kestrel import ops
 
 ext = ops.n1()
+N3 = os.environ.get("N3") == "1"
+linear_ext = ops.n3() if N3 else ext
+linear = linear_ext.n3_linear if N3 else ext.n1_linear
+linear_gelu_f8 = linear_ext.n3_linear_gelu_f8 if N3 else ext.n1_linear_gelu_f8
+linear_f8in = linear_ext.n3_linear_f8in if N3 else ext.n1_linear_f8in
+linear_f8in_gelu_f8 = linear_ext.n3_linear_f8in_gelu_f8 if N3 else ext.n1_linear_f8in_gelu_f8
 args = _parse_args()
 _init_logging(0)
 cfg = WAN_CONFIGS[args.task]
@@ -71,9 +77,9 @@ class N1Linear(nn.Module):
         if not (MODE["n1"] and self.ok and self.amax > 0):
             PATHS["linear_bf16"] += 1
             return self.lin(x)
-        PATHS["linear_n1"] += 1
+        PATHS["linear_n3" if N3 else "linear_n1"] += 1
         xb = x.to(torch.bfloat16).contiguous()
-        y = ext.n1_linear(xb, self.wq, self.sw, self.bias_bf16, self.amax / TARGET)
+        y = linear(xb, self.wq, self.sw, self.bias_bf16, self.amax / TARGET)
         return y.to(x.dtype)
 
 mods = []
@@ -94,16 +100,16 @@ class FusedFFN(nn.Module):
         if MODE["n1"] and MODE.get("fused_ffn") and self.l0.ok and self.l2.ok and self.l0.amax > 0 and self.l2.amax > 0:
             PATHS["ffn_fused"] += 1
             s_mid = self.l2.amax / TARGET
-            y8 = ext.n1_linear_gelu_f8(x.to(torch.bfloat16).contiguous(), self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
-            return ext.n1_linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(x.dtype)
+            y8 = linear_gelu_f8(x.to(torch.bfloat16).contiguous(), self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
+            return linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(x.dtype)
         PATHS["ffn_unfused"] += 1
         return self.l2(self.act(self.l0(x)))
 
     def forward_fp8(self, x):
         PATHS["ffn_fp8in"] += 1
         s_mid = self.l2.amax / TARGET
-        y8 = ext.n1_linear_f8in_gelu_f8(x, self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
-        return ext.n1_linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(torch.bfloat16)
+        y8 = linear_f8in_gelu_f8(x, self.l0.wq, self.l0.sw, self.l0.bias_bf16, self.l0.amax / TARGET, s_mid)
+        return linear_f8in(y8, self.l2.wq, self.l2.sw, self.l2.bias_bf16, s_mid).to(torch.bfloat16)
 
 if os.environ.get("FUSED_FFN") == "1":
     for blk in pipe.model.blocks:

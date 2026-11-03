@@ -14,6 +14,9 @@ def _ext(name):
 def n1():
     return _ext("n1_linear")
 
+def n3():
+    return _ext("n3_linear")
+
 def n2():
     return _ext("n2_attn")
 
