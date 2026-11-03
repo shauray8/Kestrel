@@ -99,7 +99,7 @@ def check_rms(start_frame, offset):
     qr = ext.rope_qk_append(rms(q, wq), rms(k, wk), v, cos, sin, kc1, vc1, offset)
     qo = ext.rms_rope_qk_append(q, k, v, wq, wk, 1e-6, cos, sin, kc2, vc2, offset)
     eq, ek = errors(qo, qr), errors(kc2, kc1)
-    ok = eq["max_rel"] <= 2 ** -7 and ek["max_rel"] <= 2 ** -7 and torch.equal(vc1, vc2)
+    ok = all(e["rel_l2"] < 1e-4 and e["mismatches"] < 1e-4 * q.numel() for e in (eq, ek)) and torch.equal(vc1, vc2)
     print(json.dumps({"kind": "rms_correctness", "start_frame": start_frame, "write_offset": offset, "q": eq, "k": ek,
                       "v_equal": bool(torch.equal(vc1, vc2)), "pass": ok}), flush=True)
     assert ok
