@@ -94,7 +94,7 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True):
             out = run_vm(q, k, v, cs, kv_cache["k"], kv_cache["v"], local_start_index, lo, local_end_index, advance, nq, nk, self.eps)
         else:
             if norm_in_vm:
-                q, k = self.norm_q(q), self.norm_k(k)
+                q, k = self.norm_q(q.flatten(2)).view_as(q), self.norm_k(k.flatten(2)).view_as(k)
             roped_query = ext.rope_qk_append(q, k, v, cos, sin, kv_cache["k"], kv_cache["v"], local_start_index)
             out = mf.attention(roped_query, kv_cache["k"][:, lo:local_end_index], kv_cache["v"][:, lo:local_end_index])
         kv_cache["global_end_index"].fill_(current_end)
