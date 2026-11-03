@@ -61,11 +61,11 @@ def commands(source, directory, args):
     host = source.with_suffix(".py")
     if host.is_file():
         binary = directory / "probe.cubin"
-        build = [args.nvcc, "-O3", "-std=c++17", "-arch=sm_120a", "-cubin", str(source), "-o", str(binary)]
+        build = [args.nvcc, "-O3", "-std=c++17", "-gencode", "arch=compute_120a,code=sm_120a", "-cubin", str(source), "-o", str(binary)]
         run = [sys.executable, str(host), str(binary)]
     else:
         binary = directory / "probe"
-        build = [args.nvcc, "-O3", "-std=c++17", "-arch=sm_120a", "-lineinfo", str(source), "-lcuda", "-o", str(binary)]
+        build = [args.nvcc, "-O3", "-std=c++17", "-gencode", "arch=compute_120a,code=sm_120a", "-lineinfo", str(source), "-lcuda", "-o", str(binary)]
         run = [str(binary)]
     return binary, build, run + ([] if args.iterations is None else [str(args.iterations)])
 
