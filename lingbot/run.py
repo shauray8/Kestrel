@@ -214,7 +214,8 @@ if os.environ.get("FUSED_GLUE") == "1":
         if x.dtype != torch.bfloat16 or getattr(self.norm_q, "weight", None) is None or self.norm_q.weight.dtype != torch.bfloat16:
             return _orig_xattn(self, x, context, context_lens, crossattn_cache, cross_attn_first_call)
         b, n, d = x.size(0), self.num_heads, self.head_dim
-        q = fmod.rms_bf16(self.q(x).contiguous(), self.norm_q.weight, self.norm_q.eps).view(b, -1, n, d)
+        quant = isinstance(self.q, N1Linear) and MODE["n1"] and self.q.ok and self.q.amax > 0
+        q = fmod.rms_bf16(self.q(x).contiguous(), self.norm_q.weight, self.norm_q.eps, not quant).view(b, -1, n, d)
         if crossattn_cache is not None:
             first = crossattn_cache["is_init"].item() == 0 if cross_attn_first_call is None else cross_attn_first_call
             if first:

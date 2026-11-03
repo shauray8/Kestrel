@@ -194,8 +194,10 @@ def check_glue2(M):
     q = (torch.randn(M, C, device="cuda") * 4).to(BF)
     qf = q.float()
     rref = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS) * w).to(BF)
-    rout = ext.rms_bf16(q, w, EPS)
-    rms_err, rms_mis = bf_ulp_err(rout, rref), int((rout != rref).sum())
+    rref2 = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + EPS)).to(BF) * w
+    rout, rout2 = ext.rms_bf16(q, w, EPS, False), ext.rms_bf16(q, w, EPS, True)
+    rms_err = max(bf_ulp_err(rout, rref), bf_ulp_err(rout2, rref2))
+    rms_mis = max(int((rout != rref).sum()), int((rout2 != rref2).sum()))
     xd = xr.double()
     exact = (xd - xd.mean(-1, keepdim=True)) / torch.sqrt(xd.var(-1, unbiased=False, keepdim=True) + EPS) * w.double() + b.double()
     ln_abs, torch_abs = float((out.double() - exact).abs().max()), float((ref.double() - exact).abs().max())
@@ -206,7 +208,7 @@ def check_glue2(M):
     res = {"kind": "glue2", "M": M, "cam_x_bit_exact": x_exact, "ln_max_abs": ln_abs, "torch_ln_max_abs": torch_abs, "ln_mismatch": ln_mis,
            "rms_max_ulp": rms_err, "rms_mismatch": rms_mis, "pass": ok,
            "cam_ln_torch_us": bench(torch_cam), "cam_ln_us": bench(lambda: ext.cam_ln(xk, a32, t32, w32, b32, EPS)),
-           "rms_torch_us": bench(torch_rms), "rms_us": bench(lambda: ext.rms_bf16(q, w, EPS))}
+           "rms_torch_us": bench(torch_rms), "rms_us": bench(lambda: ext.rms_bf16(q, w, EPS, False))}
     print(json.dumps(res), flush=True)
     assert ok
 

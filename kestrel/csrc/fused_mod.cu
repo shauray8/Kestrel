@@ -133,7 +133,7 @@ __global__ void __launch_bounds__(kWarps * 32) fused_mod_kernel(float *__restric
   }
 }
 
-template <int NIT>
+template <int NIT, bool RF>
 __global__ void __launch_bounds__(kWarps * 32) rms_bf16_kernel(const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ w,
                                                                __nv_bfloat16 *__restrict__ out, int M, float eps) {
   constexpr int C = NIT * 256;
@@ -164,7 +164,9 @@ __global__ void __launch_bounds__(kWarps * 32) rms_bf16_kernel(const __nv_bfloat
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
       const float2 gf = __bfloat1622float2(g[k]);
-      h[k] = __floats2bfloat162_rn(__fmul_rn(__fmul_rn(v[j][2 * k], r), gf.x), __fmul_rn(__fmul_rn(v[j][2 * k + 1], r), gf.y));
+      float2 n = make_float2(__fmul_rn(v[j][2 * k], r), __fmul_rn(v[j][2 * k + 1], r));
+      if constexpr (RF) n = __bfloat1622float2(__floats2bfloat162_rn(n.x, n.y));
+      h[k] = __floats2bfloat162_rn(__fmul_rn(n.x, gf.x), __fmul_rn(n.y, gf.y));
     }
     *reinterpret_cast<uint4 *>(out + (size_t)m * C + j * 256 + lane * 8) = pk;
   }
@@ -282,17 +284,20 @@ torch::Tensor cam_ln(torch::Tensor x, c10::optional<torch::Tensor> a, c10::optio
   return out;
 }
 
-torch::Tensor rms_bf16(torch::Tensor x, torch::Tensor w, double eps) {
+torch::Tensor rms_bf16(torch::Tensor x, torch::Tensor w, double eps, bool round_first) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.is_contiguous(), "x must be contiguous CUDA bf16");
   const int64_t C = x.size(-1), M = x.numel() / C;
   TORCH_CHECK(C % 256 == 0 && M < (1ll << 31), "C must be a multiple of 256");
   TORCH_CHECK(w.is_cuda() && w.scalar_type() == torch::kBFloat16 && w.is_contiguous() && w.numel() == C, "w must be CUDA bf16 [C]");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+              "x and w must be 16-byte aligned");
   auto out = torch::empty_like(x);
   const dim3 grid((unsigned)((M + kWarps - 1) / kWarps)), block(kWarps * 32);
   auto st = at::cuda::getCurrentCUDAStream();
   auto xp = reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr()), wp = reinterpret_cast<const __nv_bfloat16 *>(w.data_ptr());
   auto op = reinterpret_cast<__nv_bfloat16 *>(out.data_ptr());
-#define RB_CASE(N) case N: rms_bf16_kernel<N><<<grid, block, 0, st>>>(xp, wp, op, (int)M, (float)eps); break;
+#define RB_CASE(N) case N: if (round_first) rms_bf16_kernel<N, true><<<grid, block, 0, st>>>(xp, wp, op, (int)M, (float)eps); \
+                           else rms_bf16_kernel<N, false><<<grid, block, 0, st>>>(xp, wp, op, (int)M, (float)eps); break;
   switch (C / 256) {
     RB_CASE(4) RB_CASE(6) RB_CASE(8) RB_CASE(12) RB_CASE(16) RB_CASE(20)
     default: TORCH_CHECK(false, "unsupported C=", C);
@@ -316,6 +321,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("y"), py::arg("gate"), py::arg("shift"), py::arg("scale"), py::arg("eps"), py::arg("s"));
   m.def("cam_ln", &cam_ln, "x = a * x + t in place (if given), then LayerNorm(x) * w + b -> bf16", py::arg("x"), py::arg("a"),
         py::arg("t"), py::arg("w"), py::arg("b"), py::arg("eps"));
-  m.def("rms_bf16", &rms_bf16, "bf16(x * rsqrt(mean(x^2) + eps) * w) with fp32 intermediate", py::arg("x"), py::arg("w"),
-        py::arg("eps"));
+  m.def("rms_bf16", &rms_bf16, "bf16(x * rsqrt(mean(x^2) + eps) * w); round_first rounds x * rsqrt to bf16 before * w",
+        py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("round_first"));
 }
