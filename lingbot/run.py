@@ -224,9 +224,13 @@ if os.environ.get("FUSED_GLUE") == "1":
 
     _mf_glue.CausalWanAttentionBlock.forward = _glue_block_forward
 
-if os.environ.get("VM_FFN") == "1":
-    from vm_hook import install as vm_ffn_install
-    vm_ffn_install(globals())
+if os.environ.get("VM_FFN") == "1" or os.environ.get("VM_BLOCK") == "1":
+    if os.environ.get("VM_BLOCK") == "1":
+        from vm_block import install as vm_block_install
+        vm_block_install(globals())
+    else:
+        from vm_hook import install as vm_ffn_install
+        vm_ffn_install(globals())
 
 ATTN_IMPL = os.environ.get("ATTN", "n2")
 if ATTN_IMPL in ("sage2", "kvq"):
@@ -386,7 +390,7 @@ def after_calib():
 
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
-    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "XATTN")
+    _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):

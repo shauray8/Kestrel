@@ -194,6 +194,73 @@ def attn_window_case(Lq=127, Lk=193, H=4):
     return r["pass"]
 
 
+def block_ops_case(M=3120, L=512):
+    g = torch.Generator(device="cuda").manual_seed(7)
+    def linear(N, K):
+        w = torch.randn(N, K, device="cuda", generator=g) * K ** -0.5
+        b = (torch.randn(N, device="cuda", generator=g) * 0.1).to(BF)
+        wq, sw = qw(w)
+        return wq, sw, b
+    W = [linear(D, D) for _ in range(4)]
+    x = torch.randn(M, D, device="cuda", generator=g)
+    shift, scale, gate = (torch.randn(1, D, device="cuda", generator=g) * 0.1 for _ in range(3))
+    sa = 0.25
+    mod = fm.mod_norm(x.clone(), shift, scale, EPS)
+    refs = [n1.n1_linear(mod, w[0], w[1], w[2], sa) for w in W[:3]]
+    outs = [torch.empty(M, D, dtype=BF, device="cuda") for _ in range(3)]
+    p = vm.self_qkv_program(x, shift, scale, EPS, sa, *W[0], *W[1], *W[2], *outs)
+    p.run(); torch.cuda.synchronize()
+    st = p.status()
+    qkv_diff = sum(diff(a, b) for a, b in zip(outs, refs))
+    attn = torch.randn(M, D, device="cuda", dtype=BF, generator=g)
+    xr = x.clone()
+    yr = n1.n1_linear(attn, *W[3], sa)
+    fm.gated_residual(xr, yr, gate)
+    xo = x.clone()
+    y = torch.empty_like(attn)
+    po = vm.o_residual_program(attn, sa, *W[3], y, xo, gate)
+    po.run(); torch.cuda.synchronize()
+    residual_diff = diff(xo, xr)
+    context = torch.randn(L, D, device="cuda", dtype=BF, generator=g)
+    qc = torch.empty(M, D, dtype=BF, device="cuda")
+    kc, vc = (torch.empty(L, D, dtype=BF, device="cuda") for _ in range(2))
+    pc = vm.cross_qkv_program(x, context, sa, sa, *W[0], *W[1], *W[2], qc, kc, vc)
+    pc.run(); torch.cuda.synchronize()
+    cross_diff = diff(qc, refs[0]) + sum(diff(a, n1.n1_linear(context, w[0], w[1], w[2], sa)) for a, w in zip((kc, vc), W[1:3]))
+    nq, nk = (torch.randn(1, D, device="cuda", dtype=BF, generator=g) for _ in range(2))
+    pa, ca = vm.cross_attention_program(qc, kc, vc, nq, nk, EPS)
+    def rms(a, w):
+        return (a.float() * torch.rsqrt(a.float().pow(2).mean(-1, keepdim=True) + EPS)).to(BF) * w
+    qr, kr = rms(qc, nq), rms(kc, nk)
+    H = D // 128
+    ar = n2.n2_attention(qr.view(1, M, H, 128).half(), kr.view(1, L, H, 128).half(), vc.view(1, L, H, 128).half()).to(BF).view(M, D)
+    pa.run(); torch.cuda.synchronize()
+    attn_rel, attn_diff = rel(ca, ar), diff(ca, ar)
+    H, offset = D // 128, 64
+    pos = torch.arange(M, device="cuda", dtype=torch.float32)
+    inv = 1.0 / (10000 ** (torch.arange(64, device="cuda", dtype=torch.float32) / 64))
+    theta = pos[:, None] * inv[None, :]
+    cos, sin = theta.cos()[:, None].contiguous(), theta.sin()[:, None].contiguous()
+    cs = torch.stack((cos[:, 0], sin[:, 0]), -1).flatten(1).contiguous()
+    kc0 = torch.randn(offset + M, D, device="cuda", dtype=BF, generator=g)
+    vc0 = torch.randn(offset + M, D, device="cuda", dtype=BF, generator=g)
+    kcr, vcr, kcv, vcv = kc0.clone(), vc0.clone(), kc0.clone(), vc0.clone()
+    q4, k4, v4 = (t.view(1, M, H, 128) for t in outs)
+    qr4, kr4 = rms(outs[0], nq).view(1, M, H, 128), rms(outs[1], nk).view(1, M, H, 128)
+    qr4 = rope.rope_qk_append(qr4, kr4, v4, cos, sin, kcr.view(1, offset + M, H, 128), vcr.view(1, offset + M, H, 128), offset)
+    ar4 = n2.n2_attention(qr4.half(), kcr[:offset + M].view(1, offset + M, H, 128).half(),
+                          vcr[:offset + M].view(1, offset + M, H, 128).half()).to(BF)
+    ps, sa4 = vm.self_attention_program(q4, k4, v4, cs, kcv, vcv, 0, offset + M, offset, None, nq, nk, EPS)
+    ps.run(); torch.cuda.synchronize()
+    self_rel = rel(sa4, ar4)
+    statuses = [p.status(), po.status(), pc.status(), pa.status(), ps.status()]
+    r = {"test": "vm_block_ops", "M": M, "L": L, **st, "qkv_mismatch": qkv_diff, "cross_qkv_mismatch": cross_diff,
+         "residual_mismatch": residual_diff, "cross_attn_mismatch": attn_diff, "cross_attn_rel": attn_rel, "self_attn_rel": self_rel}
+    r["pass"] = all(s["err"] == "ok" and s["done"] == s["n"] for s in statuses) and qkv_diff == 0 and cross_diff == 0 \
+        and residual_diff == 0 and attn_rel < 1e-3 and self_rel < 1e-3
+    emit(r)
+    return r["pass"]
+
 def cycle_case(M=3120, timeout_ms=50.0):
     g = torch.Generator(device="cuda").manual_seed(2)
     W = weights(g)
@@ -220,7 +287,7 @@ if __name__ == "__main__":
     res = [ffn_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(M, w) for M in (4680, 3120) for w in (None, 8)]
     res += [glue_case(4680, None, rebind=True), glue_case(3120, None, bcast=True, rebind=True), rope_kv_case(), kv_advance_case(),
-            attn_window_case()]
+            attn_window_case(), block_ops_case()]
     res.append(cycle_case())
     emit({"test": "vm_all", "pass": all(res), "n": len(res)})
     sys.exit(0 if all(res) else 1)
