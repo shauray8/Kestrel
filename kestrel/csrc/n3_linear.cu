@@ -68,7 +68,7 @@ __device__ __forceinline__ void residual_pair(float *out, size_t off, float a, f
   out[off + 1] = __fadd_rn(out[off + 1], g ? __fmul_rn(yf.y, g[1]) : yf.y);
 }
 
-template <int S, int EPI>
+template <int S, int EPI, bool Cont>
 __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, const __grid_constant__ CUtensorMap bmap,
                                      const float *__restrict__ sw, const __nv_bfloat16 *__restrict__ bias,
                                      void *__restrict__ out, int M, int N, int K, float sa, float out_inv, Gate gate) {
@@ -77,15 +77,17 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
   uint64_t *full = reinterpret_cast<uint64_t *>(smem + S * (AB + BB));
   uint64_t *empty = full + S;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int grid_m = (M + BM - 1) / BM, grid_n = N / BN, kt_count = K / BK;
-  for (int pid = blockIdx.x; pid < grid_m * grid_n; pid += gridDim.x) {
+  const int grid_m = (M + BM - 1) / BM, grid_n = N / BN, kt_count = K / BK, tiles = grid_m * grid_n;
+  auto tile = [&](int pid, int &m0, int &n0) {
     const int group = pid / (8 * grid_n), first_m = group * 8, gsize = min(grid_m - first_m, 8);
-    const int m0 = (first_m + (pid % (8 * grid_n)) % gsize) * BM;
-    const int n0 = ((pid % (8 * grid_n)) / gsize) * BN;
+    m0 = (first_m + (pid % (8 * grid_n)) % gsize) * BM;
+    n0 = ((pid % (8 * grid_n)) / gsize) * BN;
+  };
+  auto init = [&](bool reinit) {
     if (tid == 256) {
 #pragma unroll
       for (int s = 0; s < S; ++s) {
-        if (pid != int(blockIdx.x)) {
+        if (reinit) {
           asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(sptr(full + s)) : "memory");
           asm volatile("mbarrier.inval.shared::cta.b64 [%0];" :: "r"(sptr(empty + s)) : "memory");
         }
@@ -94,84 +96,112 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
     __syncthreads();
-    if (warp >= 8) {
-      asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
-      if (tid == 256) {
-        for (int kt = 0; kt < kt_count; ++kt) {
-          const int s = kt % S;
-          if (kt >= S) wait_bar(empty + s, ((kt / S) - 1) & 1);
-          expect(full + s);
-          tma(sA + s * AB, &amap, full + s, kt * BK, m0);
-          tma(sB + s * BB, &bmap, full + s, kt * BK, n0);
-        }
-      }
-      asm volatile("bar.sync 1, 128;" ::: "memory");
-      asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
-    } else {
-      const int wm = warp / 4, wn = warp % 4, mi_l = lane >> 3, r = lane & 7;
-      uint32_t h[MI][NJ][2];
-      float f[MI][NJ][4];
+  };
+  auto produce = [&](int m0, int n0, int base) {
+    for (int kt = 0; kt < kt_count; ++kt) {
+      const int g = base + kt, s = g % S;
+      if (g >= S) wait_bar(empty + s, ((g / S) - 1) & 1);
+      expect(full + s);
+      tma(sA + s * AB, &amap, full + s, kt * BK, m0);
+      tma(sB + s * BB, &bmap, full + s, kt * BK, n0);
+    }
+  };
+  auto consume = [&](int m0, int n0, int base) {
+    const int wm = warp / 4, wn = warp % 4, mi_l = lane >> 3, r = lane & 7;
+    uint32_t h[MI][NJ][2];
+    float f[MI][NJ][4];
 #pragma unroll
-      for (int i = 0; i < MI; ++i)
-#pragma unroll
-        for (int j = 0; j < NJ; ++j) {
-          h[i][j][0] = h[i][j][1] = 0;
-          f[i][j][0] = f[i][j][1] = f[i][j][2] = f[i][j][3] = 0.f;
-        }
-      int step = 0;
-      for (int kt = 0; kt < kt_count; ++kt) {
-        const int s = kt % S;
-        wait_bar(full + s, (kt / S) & 1);
-        const uint8_t *a_tile = sA + s * AB, *b_tile = sB + s * BB;
-#pragma unroll
-        for (int kk = 0; kk < 2; ++kk) {
-          uint32_t a[MI][4], b[NJ][2];
-#pragma unroll
-          for (int i = 0; i < MI; ++i)
-            ldsm(a[i][0], a[i][1], a[i][2], a[i][3], a_tile + swz(wm * 64 + i * 16 + (mi_l & 1) * 8 + r, kk * 2 + (mi_l >> 1)));
-#pragma unroll
-          for (int j = 0; j < NJ / 2; ++j)
-            ldsm(b[j * 2][0], b[j * 2][1], b[j * 2 + 1][0], b[j * 2 + 1][1],
-                 b_tile + swz(wn * 32 + j * 16 + (mi_l >> 1) * 8 + r, kk * 2 + (mi_l & 1)));
-#pragma unroll
-          for (int i = 0; i < MI; ++i)
-#pragma unroll
-            for (int j = 0; j < NJ; ++j) mma(h[i][j], a[i], b[j]);
-          if (++step == 16) { step = 0; promote(h, f); }
-        }
-        __syncwarp();
-        if (lane == 0) arrive(empty + s);
-      }
-      promote(h, f);
-      const int g = lane >> 2, t4 = lane & 3;
+    for (int i = 0; i < MI; ++i)
 #pragma unroll
       for (int j = 0; j < NJ; ++j) {
-        const int col = n0 + wn * 32 + j * 8 + t4 * 2;
-        const float s0 = sa * sw[col], s1 = sa * sw[col + 1];
-        const float b0 = bias ? __bfloat162float(bias[col]) : 0.f, b1 = bias ? __bfloat162float(bias[col + 1]) : 0.f;
+        h[i][j][0] = h[i][j][1] = 0;
+        f[i][j][0] = f[i][j][1] = f[i][j][2] = f[i][j][3] = 0.f;
+      }
+    int step = 0;
+    for (int kt = 0; kt < kt_count; ++kt) {
+      const int g = base + kt, s = g % S;
+      wait_bar(full + s, (g / S) & 1);
+      const uint8_t *a_tile = sA + s * AB, *b_tile = sB + s * BB;
 #pragma unroll
-        for (int i = 0; i < MI; ++i) {
-          const int row = m0 + wm * 64 + i * 16 + g;
-          const float v0 = f[i][j][0] * s0 + b0, v1 = f[i][j][1] * s1 + b1;
-          const float v2 = f[i][j][2] * s0 + b0, v3 = f[i][j][3] * s1 + b1;
-          if constexpr (EPI == 0) {
-            auto y = reinterpret_cast<__nv_bfloat16 *>(out);
-            if (row < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)row * N + col) = __floats2bfloat162_rn(v0, v1);
-            if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)(row + 8) * N + col) = __floats2bfloat162_rn(v2, v3);
-          } else if constexpr (EPI == 1) {
-            auto y = reinterpret_cast<uint8_t *>(out);
-            if (row < M) *reinterpret_cast<uint16_t *>(y + (size_t)row * N + col) = q2(gelu(v0), gelu(v1), out_inv);
-            if (row + 8 < M) *reinterpret_cast<uint16_t *>(y + (size_t)(row + 8) * N + col) = q2(gelu(v2), gelu(v3), out_inv);
-          } else {
-            if (row < M) residual_pair(reinterpret_cast<float *>(out), (size_t)row * N + col, v0, v1,
-                                      gate.p ? gate.p + (size_t)(row / gate.rows_per) * gate.stride + col : nullptr);
-            if (row + 8 < M) residual_pair(reinterpret_cast<float *>(out), (size_t)(row + 8) * N + col, v2, v3,
-                                          gate.p ? gate.p + (size_t)((row + 8) / gate.rows_per) * gate.stride + col : nullptr);
-          }
+      for (int kk = 0; kk < 2; ++kk) {
+        uint32_t a[MI][4], b[NJ][2];
+#pragma unroll
+        for (int i = 0; i < MI; ++i)
+          ldsm(a[i][0], a[i][1], a[i][2], a[i][3], a_tile + swz(wm * 64 + i * 16 + (mi_l & 1) * 8 + r, kk * 2 + (mi_l >> 1)));
+#pragma unroll
+        for (int j = 0; j < NJ / 2; ++j)
+          ldsm(b[j * 2][0], b[j * 2][1], b[j * 2 + 1][0], b[j * 2 + 1][1],
+               b_tile + swz(wn * 32 + j * 16 + (mi_l >> 1) * 8 + r, kk * 2 + (mi_l & 1)));
+#pragma unroll
+        for (int i = 0; i < MI; ++i)
+#pragma unroll
+          for (int j = 0; j < NJ; ++j) mma(h[i][j], a[i], b[j]);
+        if (++step == 16) { step = 0; promote(h, f); }
+      }
+      __syncwarp();
+      if (lane == 0) arrive(empty + s);
+    }
+    promote(h, f);
+    const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+      const int col = n0 + wn * 32 + j * 8 + t4 * 2;
+      const float s0 = sa * sw[col], s1 = sa * sw[col + 1];
+      const float b0 = bias ? __bfloat162float(bias[col]) : 0.f, b1 = bias ? __bfloat162float(bias[col + 1]) : 0.f;
+#pragma unroll
+      for (int i = 0; i < MI; ++i) {
+        const int row = m0 + wm * 64 + i * 16 + g;
+        const float v0 = f[i][j][0] * s0 + b0, v1 = f[i][j][1] * s1 + b1;
+        const float v2 = f[i][j][2] * s0 + b0, v3 = f[i][j][3] * s1 + b1;
+        if constexpr (EPI == 0) {
+          auto y = reinterpret_cast<__nv_bfloat16 *>(out);
+          if (row < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)row * N + col) = __floats2bfloat162_rn(v0, v1);
+          if (row + 8 < M) *reinterpret_cast<__nv_bfloat162 *>(y + (size_t)(row + 8) * N + col) = __floats2bfloat162_rn(v2, v3);
+        } else if constexpr (EPI == 1) {
+          auto y = reinterpret_cast<uint8_t *>(out);
+          if (row < M) *reinterpret_cast<uint16_t *>(y + (size_t)row * N + col) = q2(gelu(v0), gelu(v1), out_inv);
+          if (row + 8 < M) *reinterpret_cast<uint16_t *>(y + (size_t)(row + 8) * N + col) = q2(gelu(v2), gelu(v3), out_inv);
+        } else {
+          if (row < M) residual_pair(reinterpret_cast<float *>(out), (size_t)row * N + col, v0, v1,
+                                    gate.p ? gate.p + (size_t)(row / gate.rows_per) * gate.stride + col : nullptr);
+          if (row + 8 < M) residual_pair(reinterpret_cast<float *>(out), (size_t)(row + 8) * N + col, v2, v3,
+                                        gate.p ? gate.p + (size_t)((row + 8) / gate.rows_per) * gate.stride + col : nullptr);
         }
       }
     }
-    __syncthreads();
+  };
+  if constexpr (Cont) {
+    init(false);
+    if (warp >= 8) {
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
+      if (tid == 256)
+        for (int pid = blockIdx.x, base = 0; pid < tiles; pid += gridDim.x, base += kt_count) {
+          int m0, n0;
+          tile(pid, m0, n0);
+          produce(m0, n0, base);
+        }
+      return;
+    }
+    for (int pid = blockIdx.x, base = 0; pid < tiles; pid += gridDim.x, base += kt_count) {
+      int m0, n0;
+      tile(pid, m0, n0);
+      consume(m0, n0, base);
+    }
+  } else {
+    for (int pid = blockIdx.x; pid < tiles; pid += gridDim.x) {
+      int m0, n0;
+      tile(pid, m0, n0);
+      init(pid != int(blockIdx.x));
+      if (warp >= 8) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
+        if (tid == 256) produce(m0, n0, 0);
+        asm volatile("bar.sync 1, 128;" ::: "memory");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
+      } else {
+        consume(m0, n0, 0);
+      }
+      __syncthreads();
+    }
   }
 }
 
@@ -210,18 +240,18 @@ CUtensorMap encode(const torch::Tensor &x, int rows, int k) {
   return map;
 }
 
-template <int S, int EPI>
+template <int S, int EPI, bool Cont>
 void launch(CUtensorMap a, CUtensorMap b, const torch::Tensor &sw, const __nv_bfloat16 *bias, torch::Tensor &y,
             int m, int n, int k, float sa, float inv, Gate gate) {
   constexpr int bytes = S * (AB + BB) + 2 * S * sizeof(uint64_t);
   static thread_local int initialized_device = -1;
   if (initialized_device != sw.get_device()) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(gemm<S, EPI>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(gemm<S, EPI, Cont>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     initialized_device = sw.get_device();
   }
   const int tiles = ((m + BM - 1) / BM) * (n / BN);
   const int blocks = std::min(tiles, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
-  gemm<S, EPI><<<blocks, THREADS, bytes, at::cuda::getCurrentCUDAStream()>>>(a, b, sw.data_ptr<float>(), bias,
+  gemm<S, EPI, Cont><<<blocks, THREADS, bytes, at::cuda::getCurrentCUDAStream()>>>(a, b, sw.data_ptr<float>(), bias,
       y.data_ptr(), m, n, k, sa, inv, gate);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -275,12 +305,14 @@ torch::Tensor run(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optio
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   const auto amap = encode(a, m, k), bmap = encode(w, n, k);
-  const char *stages = std::getenv("N3_STAGES");
+  const char *stages = std::getenv("N3_STAGES"), *cont = std::getenv("N3_CONT");
   const int s = stages ? std::atoi(stages) : 5;
+  const bool c = cont && std::atoi(cont) == 1;
   TORCH_CHECK(s >= 4 && s <= 6, "N3_STAGES must be 4, 5, or 6");
-  if (s == 4) launch<4, EPI>(amap, bmap, sw, bp, y, m, n, k, float(sa), float(1.0 / out_scale), g);
-  else if (s == 5) launch<5, EPI>(amap, bmap, sw, bp, y, m, n, k, float(sa), float(1.0 / out_scale), g);
-  else launch<6, EPI>(amap, bmap, sw, bp, y, m, n, k, float(sa), float(1.0 / out_scale), g);
+  const float sf = float(sa), inv = float(1.0 / out_scale);
+  if (s == 4) c ? launch<4, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<4, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
+  else if (s == 5) c ? launch<5, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<5, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
+  else c ? launch<6, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g) : launch<6, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g);
   return y;
 }
 

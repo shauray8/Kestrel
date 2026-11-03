@@ -63,7 +63,7 @@ def main():
             ms = timed(fn, args.iterations, flush)
             tflops = 2 * m * n * k / (ms * 1e9)
             print(json.dumps({"kind": name, "shape": [m, n, k], "cold": args.cold,
-                              "stages": int(os.environ.get("N3_STAGES", "5")), "ms": ms,
+                              "stages": int(os.environ.get("N3_STAGES", "5")), "cont": os.environ.get("N3_CONT", "0") == "1", "ms": ms,
                               "tflops": tflops, "pct_1016_peak": 100 * tflops / 1016}), flush=True)
 
 
