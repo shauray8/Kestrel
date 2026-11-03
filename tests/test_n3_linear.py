@@ -51,7 +51,11 @@ def main():
         for index, op, activation in ((0, n3.n3_linear_residual, x), (2, n3.n3_linear_f8in_residual, xq)):
             for g in (None, gate, grouped_gate):
                 expected = residual.clone()
-                mod.gated_residual(expected, calls[index][1](n1), g)
+                y = calls[index][1](n1)
+                if n % 256 == 0 and n // 256 in (4, 6, 8, 12, 16, 20):
+                    mod.gated_residual(expected, y, g)
+                else:
+                    expected += y.float() if g is None else y.float() * g.repeat_interleave(m // g.shape[0], 0)
                 actual = residual.clone()
                 op(activation, wq, sw, bias, sa, actual, g)
                 same(actual, expected)
