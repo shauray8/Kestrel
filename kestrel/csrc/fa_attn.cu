@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cmath>
 #include <cstdint>
+#include <unordered_map>
 #include <cstring>
 
 namespace {
@@ -495,19 +496,21 @@ template <int Exp, bool Mx>
 bool launch_bal(const torch::Tensor &q, const torch::Tensor &qs, const torch::Tensor &ks, const torch::Tensor &vs, torch::Tensor &out,
                 int Lq, int Lk, float scale, float threshold, CUtensorMap km, CUtensorMap vm) {
   constexpr int SMEM = 128 * D + 2 * stages(128) * TILE + 64, SLOT = 8 * 68 * 32;
-  static int per_sm = [] {
+  struct State { int per_sm = -1; torch::Tensor ws, flags; };
+  static std::unordered_map<int, State> states;
+  State &st = states[q.get_device()];
+  if (st.per_sm < 0) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(fa_bal_kernel<Exp, Mx>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-    int n = 0;
-    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fa_bal_kernel<Exp, Mx>, 288, SMEM));
-    return n;
-  }();
-  const int H = q.size(0), G = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * per_sm;
-  if (per_sm < 1 || (Lq + 127) / 128 * H < G) return false;
-  static torch::Tensor ws, flags;
-  if (!flags.defined() || flags.device() != q.device() || flags.numel() < G) {
-    ws = torch::empty({int64_t(G) * SLOT}, q.options().dtype(torch::kFloat32));
-    flags = torch::zeros({G}, q.options().dtype(torch::kInt32));
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&st.per_sm, fa_bal_kernel<Exp, Mx>, 288, SMEM));
   }
+  const int H = q.size(0), G = at::cuda::getCurrentDeviceProperties()->multiProcessorCount * st.per_sm;
+  if (st.per_sm < 1 || (Lq + 127) / 128 * H < G) return false;
+  if (!st.flags.defined()) {
+    st.ws = torch::empty({int64_t(G) * SLOT}, q.options().dtype(torch::kFloat32));
+    st.flags = torch::zeros({G}, q.options().dtype(torch::kInt32));
+    at::cuda::getCurrentCUDAStream().synchronize();
+  }
+  torch::Tensor &ws = st.ws, &flags = st.flags;
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(G);
   cfg.blockDim = dim3(288);
