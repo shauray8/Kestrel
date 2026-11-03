@@ -73,6 +73,17 @@
       "XATTN": "1",
       "ONLY": "n2_calib_rope32,n1n2_rope32"
     },
+    "best_fa": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "fa",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ROPE_KV": "1",
+      "XATTN": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32"
+    },
     "best_spec": {
       "FUSED_GLUE": "1",
       "KESTREL_E_BCAST": "1",
