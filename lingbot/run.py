@@ -430,17 +430,24 @@ for tag, n1, calib, n2 in RUNS:
     prof, prof_t = None, []
     if os.environ.get("PROFILE") == "1" and tag == os.environ.get("PROFILE_TAG", RUNS[-1][0]):
         prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
-        prof.__enter__()
         if os.environ.get("PROFILE_DIT") == "1":
-            _vae_decode = pipe.vae.decode
+            _vae_decode, _model_fwd = pipe.vae.decode, pipe.model.forward
+
+            def _forward_profiled(*a, **kw):
+                if not prof_t:
+                    torch.cuda.synchronize(); prof_t.append(time.perf_counter())
+                    prof.__enter__()
+                return _model_fwd(*a, **kw)
 
             def _decode_unprofiled(*a, **kw):
-                if not prof_t:
+                if len(prof_t) == 1:
                     torch.cuda.synchronize(); prof_t.append(time.perf_counter())
                     prof.__exit__(None, None, None)
                 return _vae_decode(*a, **kw)
 
-            pipe.vae.decode = _decode_unprofiled
+            pipe.model.forward, pipe.vae.decode = _forward_profiled, _decode_unprofiled
+        else:
+            prof.__enter__()
     torch.cuda.synchronize(); t0 = time.perf_counter()
     chunk = int(os.environ.get("CHUNK", "3"))
     generate_fn = pipe.generate
@@ -455,11 +462,13 @@ for tag, n1, calib, n2 in RUNS:
     torch.cuda.synchronize(); t1 = time.perf_counter()
     if prof is not None:
         if os.environ.get("PROFILE_DIT") == "1":
-            pipe.vae.decode = _vae_decode
-        if not prof_t:
-            prof.__exit__(None, None, None)
+            pipe.model.forward, pipe.vae.decode = _model_fwd, _vae_decode
+            if len(prof_t) == 1:
+                prof.__exit__(None, None, None); prof_t.append(t1)
+        else:
+            prof.__exit__(None, None, None); prof_t[:] = [t0, t1]
         from kestrel.timeline import summarize
-        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, (prof_t[0] if prof_t else t1) - t0)}), flush=True)
+        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, prof_t[1] - prof_t[0])}), flush=True)
     out = f"{OUT}/{os.path.basename(EXAMPLE)}_{tag}_c{chunk}.mp4"
     save_video(tensor=video[None], save_file=out, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
     if os.environ.get("TAE_LIVE") == "1" and TAE_STATS["n"]:

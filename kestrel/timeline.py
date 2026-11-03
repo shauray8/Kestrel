@@ -34,7 +34,7 @@ def summarize(prof, wall_s):
         b = by[_bucket(n)]; b[0] += 1; b[1] += d
         k = "<5us" if d < 5 else "5-20us" if d < 20 else "20-100us" if d < 100 else ">100us"
         sizes[k][0] += 1; sizes[k][1] += d
-        m = names[n[:80]]; m[0] += 1; m[1] += d
+        m = names[n[:240]]; m[0] += 1; m[1] += d
     tot = sum(e - s for s, e, _ in ev)
     gaps.sort()
     return {"wall_s": round(wall_s, 3), "gpu_span_s": round(span / 1e6, 3), "gpu_busy_s": round(busy / 1e6, 3),
@@ -43,4 +43,4 @@ def summarize(prof, wall_s):
                           "gt100us_total_ms": round(sum(g for g in gaps if g > 100) / 1e3, 1)},
             "by_class_pct": {k: {"n": v[0], "pct": round(100 * v[1] / tot, 1)} for k, v in sorted(by.items(), key=lambda kv: -kv[1][1])},
             "by_size": {k: {"n": v[0], "pct_time": round(100 * v[1] / tot, 1)} for k, v in sizes.items()},
-            "top": [{"name": k, "n": v[0], "pct": round(100 * v[1] / tot, 1)} for k, v in sorted(names.items(), key=lambda kv: -kv[1][1])[:15]]}
+            "top": [{"name": k, "n": v[0], "pct": round(100 * v[1] / tot, 1)} for k, v in sorted(names.items(), key=lambda kv: -kv[1][1])[:40]]}
