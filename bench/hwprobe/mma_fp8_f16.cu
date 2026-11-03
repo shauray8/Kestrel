@@ -1,0 +1,5 @@
+#define MMA_OPCODE "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16"
+#define MMA_OPERAND 0x38383838u
+#define MMA_K 32
+#define MMA_HALF
+#include "mma_common.cuh"
