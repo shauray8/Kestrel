@@ -61,7 +61,7 @@ class FAttention:
         if fresh and self.load_mode in (1, 3):
             st["plan"] = ext.fa_plan(st["k8"], st["v8"])
         if rebuild and self.i8:
-            st["kmean"] = k[0].float().mean(0).contiguous()
+            st["kmean"] = torch.mean(k[0], 0, dtype=torch.float32)
         qk = (127, False, True, st.get("kmean")) if self.i8 else (8, False, False, None)
         for x, packed, scales, transpose, (target, pow2, int8, mean) in ((k, "k8", "ks", False, qk),
                                                                          (v, "v8", "vs", True, (448 if self.mx else 1, self.mx, False, None))):
