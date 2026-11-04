@@ -34,3 +34,6 @@ def rope_kv():
 
 def vm():
     return _ext("vm")
+
+def nomas_glue():
+    return _ext("nomas_glue")
