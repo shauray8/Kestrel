@@ -139,6 +139,8 @@ __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ 
   }
 }
 
+__device__ __forceinline__ float i2f(int x) { return __int_as_float(x + 0x4B400000) - 12582912.f; }
+
 template <int Exp, bool Mx, bool I8 = false>
 __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_t *tK, const uint8_t *tV, int kb, int Lk, float qs,
                                         const float *ksp, const float *vsp, float threshold, int lane, float (&o)[16][4], float &m0, float &m1,
@@ -168,8 +170,8 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
     for (int j = 0; j < 8; ++j) {
       const int key = kb * BK + j * 8 + t4 * 2;
       const bool k0 = !tail || key < Lk, k1 = !tail || key + 1 < Lk;
-      f[j][0] = k0 ? float(si[j][0]) : -INFINITY; f[j][1] = k1 ? float(si[j][1]) : -INFINITY;
-      f[j][2] = k0 ? float(si[j][2]) : -INFINITY; f[j][3] = k1 ? float(si[j][3]) : -INFINITY;
+      f[j][0] = k0 ? i2f(si[j][0]) : -INFINITY; f[j][1] = k1 ? i2f(si[j][1]) : -INFINITY;
+      f[j][2] = k0 ? i2f(si[j][2]) : -INFINITY; f[j][3] = k1 ? i2f(si[j][3]) : -INFINITY;
       mx0 = fmaxf(mx0, fmaxf(f[j][0], f[j][1])); mx1 = fmaxf(mx1, fmaxf(f[j][2], f[j][3]));
     }
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
