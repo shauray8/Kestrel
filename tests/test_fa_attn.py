@@ -221,6 +221,19 @@ def test_bal(exp_mode, mx, lq, lk, h):
     print(json.dumps({"kind": "fa_bal", "lq": lq, "lk": lk, "h": h, "exp_mode": exp_mode, "mx": mx, "split_units": len(split),
                       "units": units, "rel_bal_fp32": err_bal, "rel_base_fp32": err_base}), flush=True)
 
+@pytest.mark.parametrize("bal", (False, True))
+@pytest.mark.parametrize("lq,lk,h", ((3120, 9360, 12), (3120, 3133, 12), (129, 385, 2)))
+def test_qk_int8(bal, lq, lk, h):
+    q, k, v = tensors(lq, lk, h)
+    k += torch.randn(1, h, 128, device=k.device, dtype=k.dtype) * 3
+    ref = reference(q, k, v)
+    common = dict(mode="fp8", load_mode=3, exp_mode=0, rescale_threshold=0.5, q_tile=128, mx=True, bal=bal)
+    out8 = FAttention(**common, qk="fp8")(0, q[None], k[None], v[None])[0]
+    outi = FAttention(**common, qk="int8")(0, q[None], k[None], v[None])[0]
+    err8, erri = relative(out8, ref), relative(outi, ref)
+    print(json.dumps({"kind": "fa_qk_int8", "lq": lq, "lk": lk, "h": h, "bal": bal, "rel_fp8": err8, "rel_int8": erri}), flush=True)
+    assert torch.isfinite(outi).all() and erri < err8
+
 @pytest.mark.parametrize("mode", MODES)
 def test_nondefault_stream(mode):
     ops.fa()
@@ -240,9 +253,9 @@ def test_nondefault_stream(mode):
 class QuantTrace:
     def __init__(self, ext):
         self.ext, self.calls = ext, []
-    def fa_quant(self, x, packed, scales, start, stop, transpose, target, pow2=False):
+    def fa_quant(self, x, packed, scales, start, stop, transpose, target, *rest):
         self.calls.append((x.data_ptr(), start, stop, transpose, target))
-        return self.ext.fa_quant(x, packed, scales, start, stop, transpose, target, pow2)
+        return self.ext.fa_quant(x, packed, scales, start, stop, transpose, target, *rest)
     def __getattr__(self, name):
         return getattr(self.ext, name)
 

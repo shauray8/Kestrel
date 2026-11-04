@@ -285,6 +285,8 @@ if os.environ.get("VM_FFN") == "1" or os.environ.get("VM_BLOCK") == "1":
 ATTN_IMPL = os.environ.get("ATTN", "n2")
 if ATTN_IMPL in ("sage2", "kvq"):
     from sageattention import sageattn
+if ATTN_IMPL == "sage3":
+    from sageattn3 import sageattn3_blackwell
 KVQ = FA = None
 if ATTN_IMPL == "kvq":
     from kestrel.kvq import KVQAttention
@@ -326,6 +328,11 @@ def n2_attention(q, k, v, *a, **kw):
     if ATTN_IMPL in ("sage2", "kvq"):
         PATHS["attn_sage2"] += 1
         return sageattn(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16), tensor_layout="NHD", is_causal=False).to(q.dtype)
+    if ATTN_IMPL == "sage3":
+        PATHS["attn_sage3"] += 1
+        return sageattn3_blackwell(q.transpose(1, 2).to(torch.bfloat16),
+                                  k.transpose(1, 2).to(dtype=torch.bfloat16, copy=True, memory_format=torch.contiguous_format),
+                                  v.transpose(1, 2).to(torch.bfloat16), is_causal=False).transpose(1, 2).to(q.dtype)
     PATHS["attn_n2"] += 1
     o = ext2.n2_attention(q[0].half().contiguous(), k[0].half().contiguous(), v[0].half().contiguous())
     return o[None].to(q.dtype)
@@ -467,7 +474,7 @@ CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
     _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE", "GLUE2")
     if ATTN_IMPL == "fa":
-        _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE", "FA_MX", "FA_BAL")
+        _keys += ("FA_MODE", "FA_LOAD_MODE", "FA_EXP_MODE", "FA_RESCALE_THRESHOLD", "FA_Q_TILE", "FA_MX", "FA_BAL", "FA_QK")
     _key = hashlib.sha1(json.dumps({k: os.environ.get(k) for k in _keys}, sort_keys=True).encode()).hexdigest()[:16]
     CALIB_FILE = os.path.join(os.environ["CALIB_CACHE"], _key + ".json")
     if os.path.exists(CALIB_FILE):

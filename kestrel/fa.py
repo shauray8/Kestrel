@@ -7,7 +7,7 @@ def _src(x):
 
 
 class FAttention:
-    def __init__(self, mode=None, load_mode=None, exp_mode=None, rescale_threshold=None, q_tile=None, mx=None, bal=None):
+    def __init__(self, mode=None, load_mode=None, exp_mode=None, rescale_threshold=None, q_tile=None, mx=None, bal=None, qk=None):
         self.mode = (mode if mode is not None else os.environ.get("FA_MODE", "fp8")).lower()
         self.load_mode = int(load_mode if load_mode is not None else os.environ.get("FA_LOAD_MODE", "0"))
         self.exp_mode = int(exp_mode if exp_mode is not None else os.environ.get("FA_EXP_MODE", "0"))
@@ -15,6 +15,7 @@ class FAttention:
         self.q_tile = int(q_tile if q_tile is not None else os.environ.get("FA_Q_TILE", "128"))
         self.mx = bool(int(mx if mx is not None else os.environ.get("FA_MX", "0")))
         self.bal = bool(int(bal if bal is not None else os.environ.get("FA_BAL", "0")))
+        self.i8 = (qk if qk is not None else os.environ.get("FA_QK", "fp8")).lower() == "int8"
         if self.mode not in ("fp8", "fp16"):
             raise ValueError("FA_MODE must be fp8 or fp16")
         if self.load_mode not in (0, 1, 3):
@@ -29,6 +30,8 @@ class FAttention:
             raise ValueError("FA_MX=1 requires FA_LOAD_MODE=3")
         if self.bal and (self.load_mode != 3 or self.q_tile != 128):
             raise ValueError("FA_BAL=1 requires FA_LOAD_MODE=3 and FA_Q_TILE=128")
+        if self.i8 and not self.mx:
+            raise ValueError("FA_QK=int8 requires FA_MX=1")
         self.epoch = 0
         self.state = {}
         self.stats = {"hist_quant": 0, "calls": 0}
@@ -57,12 +60,15 @@ class FAttention:
         ext = ops.fa()
         if fresh and self.load_mode in (1, 3):
             st["plan"] = ext.fa_plan(st["k8"], st["v8"])
-        for x, packed, scales, transpose, target, pow2 in ((k, "k8", "ks", False, 8, False),
-                                                           (v, "v8", "vs", True, 448 if self.mx else 1, self.mx)):
+        if rebuild and self.i8:
+            st["kmean"] = k[0].float().mean(0).contiguous()
+        qk = (127, False, True, st.get("kmean")) if self.i8 else (8, False, False, None)
+        for x, packed, scales, transpose, (target, pow2, int8, mean) in ((k, "k8", "ks", False, qk),
+                                                                         (v, "v8", "vs", True, (448 if self.mx else 1, self.mx, False, None))):
             buf = _src(x[0])
             if rebuild and st["La"]:
-                ext.fa_quant(buf, st[packed], st[scales], 0, st["La"] // 64, transpose, target, pow2)
-            ext.fa_quant(buf, st[packed], st[scales], st["La"] // 64, (L + 63) // 64, transpose, target, pow2)
+                ext.fa_quant(buf, st[packed], st[scales], 0, st["La"] // 64, transpose, target, pow2, int8, mean)
+            ext.fa_quant(buf, st[packed], st[scales], st["La"] // 64, (L + 63) // 64, transpose, target, pow2, int8, mean)
         if rebuild:
             st["epoch"] = self.epoch
             self.stats["hist_quant"] += 1
@@ -74,7 +80,8 @@ class FAttention:
             return ops.n2().n2_attention(q[0].half().contiguous(), k[0].half().contiguous(), v[0].half().contiguous())[None].to(q.dtype)
         st = self._hist(layer, q, k, v)
         ext = ops.fa()
-        ext.fa_quant(_src(q[0]), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 8)
+        ext.fa_quant(_src(q[0]), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 127 if self.i8 else 8, False, self.i8)
         out = ext.fa_attention(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"], q.shape[1], k.shape[1],
-                               q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold, st.get("plan"), self.q_tile, self.mx, self.bal)
+                               q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold,
+                               st.get("plan"), self.q_tile, self.mx, self.bal, self.i8)
         return out[None].to(q.dtype)

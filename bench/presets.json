@@ -95,6 +95,21 @@
       "FA_BAL": "1",
       "N3_CONT": "1"
     },
+    "best_sage3": {
+      "FUSED_GLUE": "1",
+      "KESTREL_E_BCAST": "1",
+      "CAM_HOIST": "1",
+      "ATTN": "sage3",
+      "FUSED_FFN": "1",
+      "ROPE32": "1",
+      "ROPE_KV": "1",
+      "XATTN": "1",
+      "ONLY": "n2_calib_rope32,n1n2_rope32",
+      "N3": "1",
+      "RMS_ROPE": "1",
+      "GLUE2": "1",
+      "N3_CONT": "1"
+    },
     "best_spec": {
       "FUSED_GLUE": "1",
       "KESTREL_E_BCAST": "1",
