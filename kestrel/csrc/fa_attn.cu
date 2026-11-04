@@ -141,10 +141,9 @@ __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ 
 
 template <int Exp, bool Mx, bool I8 = false>
 __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_t *tK, const uint8_t *tV, int kb, int Lk, float qs,
-                                        float ks, float sv, float threshold, int lane, float (&o)[16][4], float &m0, float &m1,
+                                        const float *ksp, const float *vsp, float threshold, int lane, float (&o)[16][4], float &m0, float &m1,
                                         float &l0, float &l1) {
   const int mi = lane >> 3, r = lane & 7, t4 = lane & 3;
-  const float sk = qs * ks;
   float al0, al1;
   uint32_t p0[8], p1[8];
   if constexpr (I8) {
@@ -161,6 +160,7 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
         mma_i8(si[j * 2 + 1], qa[kk], b[2], b[3]);
       }
     }
+    const float sk = qs * *ksp;
     float f[8][4];
     const bool tail = (kb + 1) * BK > Lk;
     float mx0 = -INFINITY, mx1 = -INFINITY;
@@ -201,6 +201,7 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
       mma(s[j * 2 + 1], qa[kk], b[2], b[3]);
     }
   }
+  const float sk = qs * *ksp;
   if ((kb + 1) * BK > Lk) {
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -249,6 +250,7 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
     mma(rs, pa[kk], 0x38383838u, 0x38383838u);
   }
   l0 = fmaf(l0, al0, __low2float(h2(rs[0]))); l1 = fmaf(l1, al1, __low2float(h2(rs[1])));
+  const float sv = *vsp;
   if (al0 != 1.f || al1 != 1.f) {
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
@@ -388,7 +390,7 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
         if (!tid && kb + S - 1 < nk) issue_tma(kb + S - 1);
       }
     }
-    fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS[head * nk + kb], VS[head * nk + kb], threshold, lane,
+    fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS + head * nk + kb, VS + head * nk + kb, threshold, lane,
                      o, m0, m1, l0, l1);
     if constexpr (Load == 3) {
       __syncwarp();
@@ -462,7 +464,7 @@ fa_bal_kernel(const uint8_t *__restrict__ Q, const float *__restrict__ QS, const
     for (int kb = kb0; kb < kb1; ++kb) {
       const int it = int(w - w0) + kb - kb0, buf = it % S;
       wait_bar(ready + buf, (it / S) & 1);
-      fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS[head * nk + kb], VS[head * nk + kb], threshold, lane,
+      fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS + head * nk + kb, VS + head * nk + kb, threshold, lane,
                        o, m0, m1, l0, l1);
       __syncwarp();
       if (!lane) arrive(empty + buf);
