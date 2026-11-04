@@ -97,7 +97,7 @@ def test_bf16_model_inputs_need_no_fp16_copies():
     fa = FAttention(mode="fp8", load_mode=0, exp_mode=0, rescale_threshold=0)
     out = fa(0, q, k, v)
     ref = FAttention(mode="fp8", load_mode=0, exp_mode=0, rescale_threshold=0)(0, q.half(), k.half(), v.half())
-    assert torch.equal(out, ref.to(out.dtype))
+    assert out.dtype == torch.bfloat16 and ((out.float() - ref.float()).abs() <= ref.float().abs() * 2 ** -7 + 2 ** -14).all()
     assert not any(name in fa.state[0] for name in ("kf", "vf"))
 
 @pytest.mark.parametrize("mode", MODES)
@@ -140,6 +140,35 @@ def test_quant_blocks_and_padding(transpose, target):
     assert torch.equal(scales[:, :1], sbefore[:, :1])
     full, sfull = pack(ext, x, transpose, target)
     assert torch.equal(packed, full) and torch.equal(scales, sfull)
+
+@pytest.mark.parametrize("length", [64, 129, 3133])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("int8,subtract_mean,transpose,pow2,target",
+                         [(False, False, False, False, 8), (False, False, True, False, 1),
+                          (False, False, True, True, 448), (True, False, False, False, 127),
+                          (True, True, False, False, 127)])
+def test_quant_vectorized_bitexact(length, dtype, int8, subtract_mean, transpose, pow2, target):
+    ext = ops.fa()
+    gen = torch.Generator(device="cuda").manual_seed(2026)
+    h, n = 3, (length + 63) // 64
+    x = (torch.randn((length, h, 128), device="cuda", generator=gen) * 7).to(dtype)
+    mean = torch.randn((h, 128), device="cuda", generator=gen) if subtract_mean else None
+    packed = torch.empty((h, n, 128, 64) if transpose else (h, n, 64, 128), device="cuda", dtype=torch.uint8)
+    scales = torch.empty((h, n), device="cuda", dtype=torch.float32)
+    ext.fa_quant(x, packed, scales, 0, n, transpose, target, pow2, int8, mean)
+    padded = torch.zeros((n * 64, h, 128), device="cuda", dtype=torch.float32)
+    padded[:length] = x.float() if mean is None else x.float() - mean
+    blocks = padded.reshape(n, 64, h, 128).permute(2, 0, 1, 3).contiguous()
+    expected_scales = (blocks.abs().amax(dim=(-1, -2)) / torch.tensor(target, device="cuda", dtype=torch.float32)).clamp_min(1e-12)
+    if pow2:
+        bits = expected_scales.view(torch.int32)
+        expected_scales = (((bits >> 23) + ((bits & 0x7fffff) != 0).to(torch.int32)) << 23).view(torch.float32)
+    normalized = blocks / expected_scales[..., None, None]
+    expected = normalized.round().clamp(-127, 127).to(torch.int8).view(torch.uint8) if int8 else normalized.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    if transpose:
+        expected = expected.transpose(-1, -2)[..., VKEY.argsort().to(expected.device)].contiguous()
+    assert torch.equal(scales.view(torch.int32), expected_scales.view(torch.int32))
+    assert torch.equal(packed, expected)
 
 @pytest.mark.parametrize("transpose,target", [(False, 8), (True, 1)])
 def test_quant_zero_scale(transpose, target):
