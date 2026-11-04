@@ -156,7 +156,7 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
                                         float &l0, float &l1) {
   const int mi = lane >> 3, r = lane & 7, t4 = lane & 3;
   float al0, al1;
-  uint32_t p0[8], p1[8];
+  uint32_t p0[8], p1[8], vp[2][4];
   if constexpr (I8) {
     int si[8][4];
 #pragma unroll
@@ -189,6 +189,10 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
     }
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
     mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+    if constexpr (Mx) {
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) ld4(vp[kk], tV + sw64((mi >> 1) * 8 + r, kk * 2 + (mi & 1)));
+    }
     mx0 *= sk; mx1 *= sk;
     mx0 = mx0 > m0 + threshold ? mx0 : m0;
     mx1 = mx1 > m1 + threshold ? mx1 : m1;
@@ -285,7 +289,8 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
         uint32_t b[4];
-        ld4(b, tV + sw64(j * 16 + (mi >> 1) * 8 + r, kk * 2 + (mi & 1)));
+        if (I8 && j == 0) { b[0] = vp[kk][0]; b[1] = vp[kk][1]; b[2] = vp[kk][2]; b[3] = vp[kk][3]; }
+        else ld4(b, tV + sw64(j * 16 + (mi >> 1) * 8 + r, kk * 2 + (mi & 1)));
         mma_mx(o[j * 2], pa[kk], b[0], b[1], sb);
         mma_mx(o[j * 2 + 1], pa[kk], b[2], b[3], sb);
       }
