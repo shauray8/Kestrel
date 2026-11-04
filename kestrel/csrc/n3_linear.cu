@@ -68,7 +68,7 @@ __device__ __forceinline__ void residual_pair(float *out, size_t off, float a, f
   out[off + 1] = __fadd_rn(out[off + 1], g ? __fmul_rn(yf.y, g[1]) : yf.y);
 }
 
-template <int S, int EPI, int Cont>
+template <int S, int EPI, bool Cont>
 __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, const __grid_constant__ CUtensorMap bmap,
                                      const float *__restrict__ sw, const __nv_bfloat16 *__restrict__ bias,
                                      void *__restrict__ out, int M, int N, int K, float sa, float out_inv, Gate gate, int split) {
@@ -118,52 +118,28 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
         f[i][j][0] = f[i][j][1] = f[i][j][2] = f[i][j][3] = 0.f;
       }
     int step = 0;
-    auto ld = [&](int s, int kk, uint32_t (&a)[MI][4], uint32_t (&b)[NJ][2]) {
+    for (int kt = 0; kt < kt_count; ++kt) {
+      const int g = base + kt, s = g % S;
+      wait_bar(full + s, (g / S) & 1);
       const uint8_t *a_tile = sA + s * AB, *b_tile = sB + s * BB;
 #pragma unroll
-      for (int i = 0; i < MI; ++i)
-        ldsm(a[i][0], a[i][1], a[i][2], a[i][3], a_tile + swz(wm * 64 + i * 16 + (mi_l & 1) * 8 + r, kk * 2 + (mi_l >> 1)));
+      for (int kk = 0; kk < 2; ++kk) {
+        uint32_t a[MI][4], b[NJ][2];
 #pragma unroll
-      for (int j = 0; j < NJ / 2; ++j)
-        ldsm(b[j * 2][0], b[j * 2][1], b[j * 2 + 1][0], b[j * 2 + 1][1],
-             b_tile + swz(wn * 32 + j * 16 + (mi_l >> 1) * 8 + r, kk * 2 + (mi_l & 1)));
-    };
-    auto mm = [&](const uint32_t (&a)[MI][4], const uint32_t (&b)[NJ][2]) {
+        for (int i = 0; i < MI; ++i)
+          ldsm(a[i][0], a[i][1], a[i][2], a[i][3], a_tile + swz(wm * 64 + i * 16 + (mi_l & 1) * 8 + r, kk * 2 + (mi_l >> 1)));
 #pragma unroll
-      for (int i = 0; i < MI; ++i)
+        for (int j = 0; j < NJ / 2; ++j)
+          ldsm(b[j * 2][0], b[j * 2][1], b[j * 2 + 1][0], b[j * 2 + 1][1],
+               b_tile + swz(wn * 32 + j * 16 + (mi_l >> 1) * 8 + r, kk * 2 + (mi_l & 1)));
 #pragma unroll
-        for (int j = 0; j < NJ; ++j) mma(h[i][j], a[i], b[j]);
-      if (++step == 16) { step = 0; promote(h, f); }
-    };
-    if constexpr (Cont == 2) {
-      uint32_t a0[MI][4], b0[NJ][2], a1[MI][4], b1[NJ][2];
-      wait_bar(full + base % S, (base / S) & 1);
-      ld(base % S, 0, a0, b0);
-      for (int kt = 0; kt < kt_count; ++kt) {
-        const int g = base + kt, s = g % S;
-        ld(s, 1, a1, b1);
-        mm(a0, b0);
-        if (kt + 1 < kt_count) {
-          wait_bar(full + (g + 1) % S, ((g + 1) / S) & 1);
-          ld((g + 1) % S, 0, a0, b0);
-        }
-        mm(a1, b1);
-        __syncwarp();
-        if (lane == 0) arrive(empty + s);
+        for (int i = 0; i < MI; ++i)
+#pragma unroll
+          for (int j = 0; j < NJ; ++j) mma(h[i][j], a[i], b[j]);
+        if (++step == 16) { step = 0; promote(h, f); }
       }
-    } else {
-      for (int kt = 0; kt < kt_count; ++kt) {
-        const int g = base + kt, s = g % S;
-        wait_bar(full + s, (g / S) & 1);
-#pragma unroll
-        for (int kk = 0; kk < 2; ++kk) {
-          uint32_t a[MI][4], b[NJ][2];
-          ld(s, kk, a, b);
-          mm(a, b);
-        }
-        __syncwarp();
-        if (lane == 0) arrive(empty + s);
-      }
+      __syncwarp();
+      if (lane == 0) arrive(empty + s);
     }
     promote(h, f);
     const int g = lane >> 2, t4 = lane & 3;
@@ -195,7 +171,7 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
       }
     }
   };
-  if constexpr (Cont > 0) {
+  if constexpr (Cont) {
     init(false);
     if (warp >= 8) {
       asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
@@ -265,7 +241,7 @@ CUtensorMap encode(const torch::Tensor &x, int rows, int k) {
   return map;
 }
 
-template <int S, int EPI, int Cont>
+template <int S, int EPI, bool Cont>
 void launch(CUtensorMap a, CUtensorMap b, const torch::Tensor &sw, const __nv_bfloat16 *bias, torch::Tensor &y,
             int m, int n, int k, float sa, float inv, Gate gate, int split) {
   constexpr int bytes = S * (AB + BB) + 2 * S * sizeof(uint64_t);
@@ -335,14 +311,12 @@ torch::Tensor run(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optio
   const auto amap = encode(a, m, k), bmap = encode(w, n, k);
   const char *stages = std::getenv("N3_STAGES"), *cont = std::getenv("N3_CONT");
   const int s = stages ? std::atoi(stages) : 5;
-  const int c = cont ? std::atoi(cont) : 0;
-  TORCH_CHECK(s >= 4 && s <= 6 && c >= 0 && c <= 2, "N3_STAGES must be 4, 5, or 6 and N3_CONT 0, 1, or 2");
+  const bool c = cont && std::atoi(cont) == 1;
+  TORCH_CHECK(s >= 4 && s <= 6, "N3_STAGES must be 4, 5, or 6");
   const float sf = float(sa), inv = float(1.0 / out_scale);
-#define N3_GO(S) if (c == 2) launch<S, EPI, 2>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split); \
-                 else if (c == 1) launch<S, EPI, 1>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split); \
-                 else launch<S, EPI, 0>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
-  if (s == 4) { N3_GO(4) } else if (s == 5) { N3_GO(5) } else { N3_GO(6) }
-#undef N3_GO
+  if (s == 4) c ? launch<4, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<4, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
+  else if (s == 5) c ? launch<5, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<5, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
+  else c ? launch<6, EPI, true>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split) : launch<6, EPI, false>(amap, bmap, sw, bp, y, m, n, k, sf, inv, g, split);
   return y;
 }
 
