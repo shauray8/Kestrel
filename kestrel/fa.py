@@ -83,5 +83,5 @@ class FAttention:
         ext.fa_quant(_src(q[0]), st["q8"], st["qs"], 0, (q.shape[1] + 63) // 64, False, 127 if self.i8 else 8, False, self.i8)
         out = ext.fa_attention(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"], q.shape[1], k.shape[1],
                                q.shape[-1] ** -0.5 if sm_scale is None else sm_scale, self.load_mode, self.exp_mode, self.rescale_threshold,
-                               st.get("plan"), self.q_tile, self.mx, self.bal, self.i8)
-        return out[None].to(q.dtype)
+                               st.get("plan"), self.q_tile, self.mx, self.bal, self.i8, q.dtype == torch.bfloat16)
+        return out[None] if out.dtype == q.dtype else out[None].to(q.dtype)

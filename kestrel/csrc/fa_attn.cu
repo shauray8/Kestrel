@@ -97,16 +97,20 @@ template <typename In, bool Transpose>
 __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ out, float *__restrict__ scales,
                                 int L, int H, int nb, int first, float target, bool pow2, bool int8, const float *__restrict__ mean) {
   __shared__ float maxima[8];
-  __shared__ uint8_t tile[Transpose ? TILE : 1];
+  __shared__ __align__(8) uint8_t tile[Transpose ? TILE : 1];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, block = first + blockIdx.x, head = blockIdx.y;
-  float2 values[16];
+  float2 values[4][4];
   float mx = 0.f;
 #pragma unroll
-  for (int j = 0; j < 16; ++j) {
-    int pair = tid + j * T, row = pair / 64, col = (pair % 64) * 2, token = block * BK + row;
-    values[j] = token < L ? load2(x + (size_t(token) * H + head) * D + col) : make_float2(0.f, 0.f);
-    if (mean && token < L) { values[j].x -= mean[head * D + col]; values[j].y -= mean[head * D + col + 1]; }
-    mx = fmaxf(mx, fmaxf(fabsf(values[j].x), fabsf(values[j].y)));
+  for (int j = 0; j < 4; ++j) {
+    int vec = tid + j * T, row = vec / 16, col = (vec % 16) * 8, token = block * BK + row;
+    uint4 raw = token < L ? *reinterpret_cast<const uint4 *>(x + (size_t(token) * H + head) * D + col) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      values[j][k] = load2(reinterpret_cast<const In *>(&raw) + k * 2);
+      if (mean && token < L) { values[j][k].x -= mean[head * D + col + k * 2]; values[j][k].y -= mean[head * D + col + k * 2 + 1]; }
+      mx = fmaxf(mx, fmaxf(fabsf(values[j][k].x), fabsf(values[j][k].y)));
+    }
   }
 #pragma unroll
   for (int d = 16; d; d >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, d));
@@ -119,13 +123,18 @@ __global__ void fa_quant_kernel(const In *__restrict__ x, uint8_t *__restrict__ 
   if (!tid) scales[head * nb + block] = sc;
   uint8_t *dst = out + (size_t(head) * nb + block) * TILE;
 #pragma unroll
-  for (int j = 0; j < 16; ++j) {
-    const int pair = tid + j * T;
-    uint16_t q = int8 ? uint16_t(uint8_t(int8_t(max(-127, min(127, __float2int_rn(values[j].x / sc)))))
-                                 | (uint16_t(uint8_t(int8_t(max(-127, min(127, __float2int_rn(values[j].y / sc)))))) << 8))
-                      : uint16_t(quant2(values[j].x / sc, values[j].y / sc));
-    if constexpr (Transpose) *reinterpret_cast<uint16_t *>(tile + pair * 2) = q;
-    else *reinterpret_cast<uint16_t *>(dst + pair * 2) = q;
+  for (int j = 0; j < 4; ++j) {
+    const int vec = tid + j * T;
+    uint32_t q[2] = {};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      uint16_t pair = int8 ? uint16_t(uint8_t(int8_t(max(-127, min(127, __float2int_rn(values[j][k].x / sc)))))
+                                      | (uint16_t(uint8_t(int8_t(max(-127, min(127, __float2int_rn(values[j][k].y / sc)))))) << 8))
+                           : uint16_t(quant2(values[j][k].x / sc, values[j][k].y / sc));
+      q[k / 2] |= uint32_t(pair) << ((k & 1) * 16);
+    }
+    if constexpr (Transpose) *reinterpret_cast<uint2 *>(tile + vec * 8) = make_uint2(q[0], q[1]);
+    else *reinterpret_cast<uint2 *>(dst + vec * 8) = make_uint2(q[0], q[1]);
   }
   if constexpr (Transpose) {
     __syncthreads();
@@ -303,14 +312,20 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
 }
 
 __device__ __forceinline__ void fa_store(const float (&o)[16][4], float l0, float l1, int row0, int lane, int Lq, int H, int head,
-                                         half *__restrict__ O) {
+                                         void *__restrict__ O, bool obf) {
   const float inv0 = 1.f / l0, inv1 = 1.f / l1;
   const int row1 = row0 + 8, t4 = lane & 3;
 #pragma unroll
   for (int j = 0; j < 16; ++j) {
     int col = j * 8 + t4 * 2;
-    if (row0 < Lq) *reinterpret_cast<__half2 *>(O + (size_t(row0) * H + head) * D + col) = __floats2half2_rn(o[j][0] * inv0, o[j][1] * inv0);
-    if (row1 < Lq) *reinterpret_cast<__half2 *>(O + (size_t(row1) * H + head) * D + col) = __floats2half2_rn(o[j][2] * inv1, o[j][3] * inv1);
+    const size_t a = (size_t(row0) * H + head) * D + col, b = (size_t(row1) * H + head) * D + col;
+    if (obf) {
+      if (row0 < Lq) *reinterpret_cast<__nv_bfloat162 *>(static_cast<__nv_bfloat16 *>(O) + a) = __floats2bfloat162_rn(o[j][0] * inv0, o[j][1] * inv0);
+      if (row1 < Lq) *reinterpret_cast<__nv_bfloat162 *>(static_cast<__nv_bfloat16 *>(O) + b) = __floats2bfloat162_rn(o[j][2] * inv1, o[j][3] * inv1);
+    } else {
+      if (row0 < Lq) *reinterpret_cast<__half2 *>(static_cast<half *>(O) + a) = __floats2half2_rn(o[j][0] * inv0, o[j][1] * inv0);
+      if (row1 < Lq) *reinterpret_cast<__half2 *>(static_cast<half *>(O) + b) = __floats2half2_rn(o[j][2] * inv1, o[j][3] * inv1);
+    }
   }
 }
 
@@ -318,7 +333,7 @@ template <int Load, int Exp, int QTile, bool Mx = false, bool I8 = false>
 __global__ void __launch_bounds__(QTile * 2 + (Load == 3 ? 32 : 0), QTile == 64 ? 2 : 1)
 fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const uint8_t *__restrict__ V,
           const float *__restrict__ QS, const float *__restrict__ KS, const float *__restrict__ VS,
-          half *__restrict__ O, int Lq, int Lk, int H, float scale_log2, float threshold,
+          void *__restrict__ O, bool obf, int Lq, int Lk, int H, float scale_log2, float threshold,
           const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap) {
   constexpr int W = QTile / 16, NT = W * 32, S = stages(QTile);
   extern __shared__ __align__(1024) uint8_t smem[];
@@ -409,7 +424,7 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
       if (!lane) arrive(empty + buf);
     }
   }
-  fa_store(o, l0, l1, q0 + warp * 16 + g, lane, Lq, H, head, O);
+  fa_store(o, l0, l1, q0 + warp * 16 + g, lane, Lq, H, head, O, obf);
 }
 
 __device__ __forceinline__ void bar_compute(int n) { asm volatile("bar.sync 1, %0;" :: "r"(n) : "memory"); }
@@ -423,7 +438,7 @@ __device__ __forceinline__ void st_release(int *p, int v) { asm volatile("st.rel
 template <int Exp, bool Mx, bool I8 = false>
 __global__ void __launch_bounds__(288, 1)
 fa_bal_kernel(const uint8_t *__restrict__ Q, const float *__restrict__ QS, const float *__restrict__ KS, const float *__restrict__ VS,
-              half *__restrict__ O, int Lq, int Lk, int H, float scale_log2, float threshold,
+              void *__restrict__ O, bool obf, int Lq, int Lk, int H, float scale_log2, float threshold,
               const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap, float *__restrict__ ws,
               int *__restrict__ flags) {
   constexpr int QTile = 128, W = 8, NT = 256, S = stages(QTile), SLOT = W * 68 * 32;
@@ -509,9 +524,9 @@ fa_bal_kernel(const uint8_t *__restrict__ Q, const float *__restrict__ QS, const
       }
       bar_compute(NT);
       if (!tid) flags[c + 1] = 0;
-      fa_store(o, l0, l1, row0, lane, Lq, H, head, O);
+      fa_store(o, l0, l1, row0, lane, Lq, H, head, O, obf);
     } else {
-      fa_store(o, l0, l1, row0, lane, Lq, H, head, O);
+      fa_store(o, l0, l1, row0, lane, Lq, H, head, O, obf);
     }
     w = we;
   }
@@ -553,7 +568,7 @@ void launch(const torch::Tensor &q, const torch::Tensor &k, const torch::Tensor 
   (void)configured;
   fa_kernel<Load, Exp, QTile, Mx, I8><<<dim3((Lq + QTile - 1) / QTile, q.size(0)), NT, SMEM, at::cuda::getCurrentCUDAStream()>>>(
     q.data_ptr<uint8_t>(), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(), qs.data_ptr<float>(), ks.data_ptr<float>(), vs.data_ptr<float>(),
-    reinterpret_cast<half *>(out.data_ptr()), Lq, Lk, q.size(0), scale * 1.4426950408889634f, threshold, km, vm);
+    out.data_ptr(), out.scalar_type() == torch::kBFloat16, Lq, Lk, q.size(0), scale * 1.4426950408889634f, threshold, km, vm);
 }
 
 template <int Exp, bool Mx, bool I8 = false>
@@ -587,7 +602,7 @@ bool launch_bal(const torch::Tensor &q, const torch::Tensor &qs, const torch::Te
   cfg.numAttrs = 1;
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, fa_bal_kernel<Exp, Mx, I8>, static_cast<const uint8_t *>(q.data_ptr<uint8_t>()),
                                     static_cast<const float *>(qs.data_ptr<float>()), static_cast<const float *>(ks.data_ptr<float>()),
-                                    static_cast<const float *>(vs.data_ptr<float>()), reinterpret_cast<half *>(out.data_ptr()), Lq, Lk,
+                                    static_cast<const float *>(vs.data_ptr<float>()), out.data_ptr(), out.scalar_type() == torch::kBFloat16, Lq, Lk,
                                     H, scale * 1.4426950408889634f, threshold, km, vm, ws.data_ptr<float>(), flags.data_ptr<int>()));
   return true;
 }
@@ -640,7 +655,7 @@ torch::Tensor fa_plan(torch::Tensor k, torch::Tensor v) {
 
 torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor qs, torch::Tensor ks, torch::Tensor vs,
                             int Lq, int Lk, double sm_scale, int load_mode, int exp_mode, double rescale_threshold,
-                            c10::optional<torch::Tensor> plan, int q_tile, bool mx, bool bal, bool i8) {
+                            c10::optional<torch::Tensor> plan, int q_tile, bool mx, bool bal, bool i8, bool bf16_out) {
   check_packed(q, "q"); check_packed(k, "k"); check_packed(v, "v");
   const c10::cuda::CUDAGuard guard(q.device());
   int H = q.size(0), nq = (Lq + BK - 1) / BK, nk = (Lk + BK - 1) / BK;
@@ -661,7 +676,7 @@ torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, to
     std::memcpy(&km, maps.data_ptr(), sizeof(km));
     std::memcpy(&vm, maps.data_ptr<uint8_t>() + sizeof(km), sizeof(vm));
   }
-  auto out = torch::empty({Lq, H, D}, q.options().dtype(torch::kHalf));
+  auto out = torch::empty({Lq, H, D}, q.options().dtype(bf16_out ? torch::kBFloat16 : torch::kHalf));
   TORCH_CHECK(!bal || (load_mode == 3 && q_tile == 128), "bal requires load_mode 3 and q_tile 128");
   TORCH_CHECK(!i8 || (mx && load_mode == 3), "i8 requires mx and load_mode 3");
   if (bal) {
@@ -698,5 +713,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("qs"), pybind11::arg("ks"), pybind11::arg("vs"), pybind11::arg("Lq"), pybind11::arg("Lk"),
         pybind11::arg("sm_scale"), pybind11::arg("load_mode"), pybind11::arg("exp_mode"), pybind11::arg("rescale_threshold"),
         pybind11::arg("plan") = pybind11::none(), pybind11::arg("q_tile") = 128, pybind11::arg("mx") = false, pybind11::arg("bal") = false,
-        pybind11::arg("i8") = false);
+        pybind11::arg("i8") = false, pybind11::arg("bf16_out") = false);
 }

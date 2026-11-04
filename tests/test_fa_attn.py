@@ -222,6 +222,18 @@ def test_bal(exp_mode, mx, lq, lk, h):
                       "units": units, "rel_bal_fp32": err_bal, "rel_base_fp32": err_base}), flush=True)
 
 @pytest.mark.parametrize("bal", (False, True))
+def test_bf16_out(bal):
+    ext = ops.fa()
+    q, k, v = tensors(3120, 3133, 12)
+    (q8, qs), (k8, ks), (v8, vs) = pack(ext, q), pack(ext, k), pack(ext, v, True, 1)
+    vm8, vms = torch.empty_like(v8), torch.empty_like(vs)
+    ext.fa_quant(v, vm8, vms, 0, vms.shape[1], True, 448, True)
+    args = (q8, k8, vm8, qs, ks, vms, 3120, 3133, 128 ** -0.5, 3, 0, 0.5, ext.fa_plan(k8, vm8), 128, True, bal, False)
+    h, b = ext.fa_attention(*args, False), ext.fa_attention(*args, True)
+    assert b.dtype == torch.bfloat16 and h.dtype == torch.float16
+    assert ((b.float() - h.float()).abs() <= h.float().abs() * 2 ** -7 + 2 ** -14).all()
+
+@pytest.mark.parametrize("bal", (False, True))
 @pytest.mark.parametrize("lq,lk,h", ((3120, 9360, 12), (3120, 3133, 12), (129, 385, 2)))
 def test_qk_int8(bal, lq, lk, h):
     q, k, v = tensors(lq, lk, h)

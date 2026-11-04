@@ -195,7 +195,7 @@ if os.environ.get("FUSED_GLUE") == "1":
     GLUE2 = os.environ.get("GLUE2") == "1"
 
     def _cam_at(self, emb, current_start):
-        key = (current_start, id(emb), emb.data_ptr())
+        key = CAM["start"] if CAM["start"] is not None else (current_start, id(emb), emb.data_ptr())
         if getattr(self, "_g2cam", (None,))[0] != key:
             h = self.cam_injector_layer2(torch.nn.functional.silu(self.cam_injector_layer1(emb))) + emb
             self._g2cam = (key, (1.0 + self.cam_scale_layer(h)).float().contiguous(), self.cam_shift_layer(h).float().contiguous())
