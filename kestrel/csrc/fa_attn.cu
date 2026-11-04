@@ -163,22 +163,21 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
       }
     }
     const float sk = qs * *ksp;
-    float f[8][4];
+    const bool tail = (kb + 1) * BK > Lk;
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+    if (!tail) {
+      int a = max(si[0][0], si[0][1]), b = max(si[0][2], si[0][3]);
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
-#pragma unroll
-      for (int i = 0; i < 4; ++i) f[j][i] = i2f(si[j][i]);
-    if ((kb + 1) * BK > Lk) {
+      for (int j = 1; j < 8; ++j) { a = max(a, max(si[j][0], si[j][1])); b = max(b, max(si[j][2], si[j][3])); }
+      mx0 = i2f(a); mx1 = i2f(b);
+    } else {
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         const int key = kb * BK + j * 8 + t4 * 2;
-        if (key >= Lk) f[j][0] = f[j][2] = -INFINITY;
-        if (key + 1 >= Lk) f[j][1] = f[j][3] = -INFINITY;
+        if (key < Lk) { mx0 = fmaxf(mx0, i2f(si[j][0])); mx1 = fmaxf(mx1, i2f(si[j][2])); }
+        if (key + 1 < Lk) { mx0 = fmaxf(mx0, i2f(si[j][1])); mx1 = fmaxf(mx1, i2f(si[j][3])); }
       }
     }
-    float mx0 = fmaxf(f[0][0], f[0][1]), mx1 = fmaxf(f[0][2], f[0][3]);
-#pragma unroll
-    for (int j = 1; j < 8; ++j) { mx0 = fmaxf(mx0, fmaxf(f[j][0], f[j][1])); mx1 = fmaxf(mx1, fmaxf(f[j][2], f[j][3])); }
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
     mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
     mx0 *= sk; mx1 *= sk;
@@ -186,10 +185,16 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
     mx1 = mx1 > m1 + threshold ? mx1 : m1;
     al0 = ex2(m0 - mx0); al1 = ex2(m1 - mx1);
     m0 = mx0; m1 = mx1;
-    const float c0 = mx0 - 8.f, c1 = mx1 - 8.f;
+    const float c0 = fmaf(12582912.f, sk, mx0 - 8.f), c1 = fmaf(12582912.f, sk, mx1 - 8.f);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      float e[4] = {fmaf(f[j][0], sk, -c0), fmaf(f[j][1], sk, -c0), fmaf(f[j][2], sk, -c1), fmaf(f[j][3], sk, -c1)};
+      float e[4] = {fmaf(__int_as_float(si[j][0] + 0x4B400000), sk, -c0), fmaf(__int_as_float(si[j][1] + 0x4B400000), sk, -c0),
+                    fmaf(__int_as_float(si[j][2] + 0x4B400000), sk, -c1), fmaf(__int_as_float(si[j][3] + 0x4B400000), sk, -c1)};
+      if (tail) {
+        const int key = kb * BK + j * 8 + t4 * 2;
+        if (key >= Lk) e[0] = e[2] = -INFINITY;
+        if (key + 1 >= Lk) e[1] = e[3] = -INFINITY;
+      }
 #pragma unroll
       for (int i = 0; i < 4; ++i) e[i] = Exp == 1 && (j & 3) == 0 ? poly_exp2(e[i]) : ex2(e[i]);
       p0[j] = quant2(e[0], e[1]); p1[j] = quant2(e[2], e[3]);
