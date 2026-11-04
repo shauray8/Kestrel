@@ -164,16 +164,21 @@ __device__ __forceinline__ void fa_step(const uint32_t (&qa)[4][4], const uint8_
     }
     const float sk = qs * *ksp;
     float f[8][4];
-    const bool tail = (kb + 1) * BK > Lk;
-    float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const int key = kb * BK + j * 8 + t4 * 2;
-      const bool k0 = !tail || key < Lk, k1 = !tail || key + 1 < Lk;
-      f[j][0] = k0 ? i2f(si[j][0]) : -INFINITY; f[j][1] = k1 ? i2f(si[j][1]) : -INFINITY;
-      f[j][2] = k0 ? i2f(si[j][2]) : -INFINITY; f[j][3] = k1 ? i2f(si[j][3]) : -INFINITY;
-      mx0 = fmaxf(mx0, fmaxf(f[j][0], f[j][1])); mx1 = fmaxf(mx1, fmaxf(f[j][2], f[j][3]));
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) f[j][i] = i2f(si[j][i]);
+    if ((kb + 1) * BK > Lk) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int key = kb * BK + j * 8 + t4 * 2;
+        if (key >= Lk) f[j][0] = f[j][2] = -INFINITY;
+        if (key + 1 >= Lk) f[j][1] = f[j][3] = -INFINITY;
+      }
     }
+    float mx0 = fmaxf(f[0][0], f[0][1]), mx1 = fmaxf(f[0][2], f[0][3]);
+#pragma unroll
+    for (int j = 1; j < 8; ++j) { mx0 = fmaxf(mx0, fmaxf(f[j][0], f[j][1])); mx1 = fmaxf(mx1, fmaxf(f[j][2], f[j][3])); }
     mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
     mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
     mx0 *= sk; mx1 *= sk;
