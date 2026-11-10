@@ -6,8 +6,10 @@ MODELS = os.environ.get("KESTREL_MODELS", "/workspace/models")
 OUT = os.environ.get("KESTREL_OUT", "/workspace/samples/kestrel")
 TAEHV = os.environ.get("KESTREL_TAEHV", "/workspace/taehv")
 EXAMPLE = os.environ.get("EXAMPLE", "examples/05")
-sys.argv = [sys.argv[0], "--task", "i2v-1.3B", "--size", "480*832",
-            "--ckpt_dir", f"{MODELS}/lingbot13b", "--assets_dir", f"{MODELS}/lingbot_assets",
+BIG = os.environ.get("MODEL") == "14b"
+ACTION = os.environ.get("ACTION", EXAMPLE)
+sys.argv = [sys.argv[0], "--task", "i2v-A14B" if BIG else "i2v-1.3B", "--size", "480*832",
+            "--ckpt_dir", f"{MODELS}/lingbot14b" if BIG else f"{MODELS}/lingbot13b", "--assets_dir", f"{MODELS}/lingbot_assets",
             "--local_attn_size", os.environ.get("WINDOW", "18"), "--sink_size", os.environ.get("SINK", "6"), "--offload_model", "False",
             "--image", f"{EXAMPLE}/image.jpg", "--action_path", EXAMPLE]
 sys.path.insert(0, os.getcwd())
@@ -30,9 +32,14 @@ linear_f8in_gelu_f8 = linear_ext.n3_linear_f8in_gelu_f8 if N3 else ext.n1_linear
 args = _parse_args()
 _init_logging(0)
 cfg = WAN_CONFIGS[args.task]
-pipe = wan.WanI2VCausal(config=cfg, checkpoint_dir=args.ckpt_dir, device_id=0, rank=0,
+from offload import dit_on_cpu, BlockOffload, lean_loader
+if BIG:
+    import wan.image2video as _w_i2v
+    lean_loader(_w_i2v)
+with (dit_on_cpu(wan.WanI2VCausal) if BIG else __import__("contextlib").nullcontext()):
+  pipe = wan.WanI2VCausal(config=cfg, checkpoint_dir=args.ckpt_dir, device_id=0, rank=0,
                         t5_fsdp=False, dit_fsdp=False, use_sp=False, t5_cpu=True,
-                        convert_model_dtype=False, local_attn_size=args.local_attn_size,
+                        convert_model_dtype=BIG or os.environ.get("CONVERT") == "1", local_attn_size=args.local_attn_size,
                         sink_size=args.sink_size, infer_mode="causal_fast", assets_dir=args.assets_dir)
 
 class T5Offload:
@@ -43,6 +50,19 @@ class T5Offload:
         return getattr(self.enc, name)
 
     def __call__(self, texts, device):
+        if BIG:
+            ts = [t for t in list(self.enc.model.parameters()) + list(self.enc.model.buffers())]
+            if not hasattr(self, "host"):
+                self.host = [t.data.cpu() for t in ts]
+            for t, h in zip(ts, self.host):
+                t.data = h.to(device, non_blocking=True)
+            try:
+                out = self.enc(texts, device)
+            finally:
+                for t, h in zip(ts, self.host):
+                    t.data = h
+            torch.cuda.empty_cache()
+            return out
         out = self.enc(texts, device)
         self.enc.model.cpu()
         torch.cuda.empty_cache()
@@ -51,6 +71,10 @@ class T5Offload:
 if os.environ.get("T5_CPU") != "1":
     pipe.t5_cpu = False
     pipe.text_encoder = T5Offload(pipe.text_encoder)
+    if BIG:
+        _t5m = pipe.text_encoder.enc.model
+        _t5m.to = lambda *a, **k: _t5m
+        _t5m.cpu = lambda *a, **k: _t5m
 if os.environ.get("SPEC") == "1":
     from spec_forcing import install as spec_install
     spec_install(pipe)
@@ -83,7 +107,7 @@ class N1Linear(nn.Module):
         return y.to(x.dtype)
 
 mods = []
-for blk in pipe.model.blocks:
+for blk in ([] if os.environ.get("NO_N1") == "1" else pipe.model.blocks):
     for name, mod in list(blk.named_modules()):
         for cname, child in list(mod.named_children()):
             if isinstance(child, nn.Linear):
@@ -446,8 +470,13 @@ if os.environ.get("GRAPHS"):
     GR = Graphs(pipe.model, lambda: not MODE["calib"])
 
 os.makedirs(OUT, exist_ok=True)
-prompt = open(f"{EXAMPLE}/prompt.txt").read().strip()
-img = Image.open(f"{EXAMPLE}/image.jpg").convert("RGB")
+prompt = open(os.environ.get("PROMPT_FILE", f"{EXAMPLE}/prompt.txt")).read().strip()
+img = Image.open(os.environ.get("IMAGE", f"{EXAMPLE}/image.jpg")).convert("RGB")
+SAMPLE = None
+if os.environ.get("SAMPLE_DIR"):
+    from sample_io import Recorder
+    SAMPLE = Recorder(pipe, os.environ["SAMPLE_DIR"], os.environ.get("SAMPLE_NAME", os.path.basename(EXAMPLE)), prompt,
+                      os.environ.get("IMAGE", f"{EXAMPLE}/image.jpg"), ACTION, ATTN_IMPL, cfg.sample_fps)
 RUNS = RUNS_OVERRIDE or [("bf16_calib", False, True, False), ("bf16", False, False, False), ("n1", True, False, False),
                          ("n2", False, False, True), ("n1n2", True, False, True)]
 if os.environ.get("FP4_FFN") == "1":
@@ -467,9 +496,36 @@ def after_calib():
             if m.ok and m.amax > 0 and m.lin.weight.numel():
                 m.lin.weight.data = torch.empty(0, device=m.lin.weight.device, dtype=m.lin.weight.dtype)
         torch.cuda.empty_cache()
+    if OFFLOAD is not None and os.environ.get("RESIDENT", "1") == "1":
+        OFFLOAD.resident()
+        print(json.dumps({"exp": "resident", "gpu_gb": round(torch.cuda.memory_allocated() / 1e9, 2)}), flush=True)
     if "VM_WARMUP" in globals():
         VM_WARMUP()
 
+OFFLOAD = None
+if BIG:
+    for m in mods:
+        if m.bias_bf16 is not None:
+            m.bias_bf16 = m.bias_bf16.cuda()
+    OFFLOAD = BlockOffload(pipe.model)
+    print(json.dumps({"exp": "offload", "gpu_gb": round(torch.cuda.memory_allocated() / 1e9, 2)}), flush=True)
+    if os.environ.get("RESIDENT_START") == "1":
+        OFFLOAD.resident()
+        print(json.dumps({"exp": "resident", "gpu_gb": round(torch.cuda.memory_allocated() / 1e9, 2)}), flush=True)
+if BIG:
+    _KV = []
+    _init_kv = pipe._initialize_self_kv_cache
+    pipe._initialize_self_kv_cache = lambda *a, **kw: (_KV.append(_init_kv(*a, **kw)) or _KV[-1])
+    _decode = pipe.vae.decode
+
+    def _decode_free(*a, **kw):
+        for c in _KV:
+            for d in c:
+                d["k"] = d["v"] = None
+        _KV.clear()
+        torch.cuda.empty_cache()
+        return _decode(*a, **kw)
+    pipe.vae.decode = _decode_free
 CALIB_FILE = None
 if os.environ.get("CALIB_CACHE"):
     _keys = ("ATTN", "ROPE32", "FUSED_GLUE", "KESTREL_E_BCAST", "CAM_HOIST", "CHUNK", "STEPS_IDX", "WINDOW", "SINK", "EXAMPLE", "FRAMES", "SEED", "AMAX_TARGET", "SPEC", "ROPE_KV", "VM_ATTN", "VM_BLOCK", "XATTN", "RMS_ROPE", "GLUE2")
@@ -484,99 +540,115 @@ if os.environ.get("CALIB_CACHE"):
         CALIB_FILE = None
         after_calib()
         print(json.dumps({"exp": "calib_cache", "hit": True, "key": _key}), flush=True)
-for tag, n1, calib, n2 in RUNS:
-    MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
-    if FA is not None:
-        FA.new_epoch()
-        ATTN_STATE.update(layer=0, start=None)
-    for m in CAM.get("mods", []):
-        m.key, m.val = None, None
-    CAM.update(hits=0, miss=0)
-    if os.environ.get("TAE_LIVE") == "1":
-        TAE_STATS.update(n=0, ms=0.0, frames=[], t_start=[], t_pix=[], last_start=None)
-        _stream.reset()
-    prof, prof_t = None, []
-    if os.environ.get("PROFILE") == "1" and tag == os.environ.get("PROFILE_TAG", RUNS[-1][0]):
-        prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
-        if os.environ.get("PROFILE_DIT") == "1":
-            _vae_decode, _model_fwd = pipe.vae.decode, pipe.model.forward
+ITEMS = [None] + (json.load(open(os.environ["BATCH"])) if os.environ.get("BATCH") else [])
+for item in ITEMS:
+    if item is None:
+        runs_now = [r for r in RUNS if r[2]] if len(ITEMS) > 1 else RUNS
+    else:
+        runs_now = [r for r in RUNS if not r[2]]
+        prompt = open(item["prompt"]).read().strip()
+        img = Image.open(item["image"]).convert("RGB")
+        ACTION = item["action"]
+        os.environ["FRAMES"], os.environ["SEED"] = str(item["frames"]), str(item.get("seed", 42))
+        if SAMPLE:
+            SAMPLE.name, SAMPLE.prompt, SAMPLE.image, SAMPLE.action = item["name"], prompt, item["image"], ACTION
+    for tag, n1, calib, n2 in runs_now:
+        MODE.update(n1=n1, calib=calib, n2=n2, tae=not calib, fp4=tag.endswith("_fp4"))
+        if FA is not None:
+            FA.new_epoch()
+            ATTN_STATE.update(layer=0, start=None)
+        for m in CAM.get("mods", []):
+            m.key, m.val = None, None
+        CAM.update(hits=0, miss=0)
+        if os.environ.get("TAE_LIVE") == "1":
+            TAE_STATS.update(n=0, ms=0.0, frames=[], t_start=[], t_pix=[], last_start=None)
+            _stream.reset()
+        prof, prof_t = None, []
+        if os.environ.get("PROFILE") == "1" and tag == os.environ.get("PROFILE_TAG", RUNS[-1][0]):
+            prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+            if os.environ.get("PROFILE_DIT") == "1":
+                _vae_decode, _model_fwd = pipe.vae.decode, pipe.model.forward
 
-            def _forward_profiled(*a, **kw):
-                if not prof_t:
-                    torch.cuda.synchronize(); prof_t.append(time.perf_counter())
-                    prof.__enter__()
-                return _model_fwd(*a, **kw)
+                def _forward_profiled(*a, **kw):
+                    if not prof_t:
+                        torch.cuda.synchronize(); prof_t.append(time.perf_counter())
+                        prof.__enter__()
+                    return _model_fwd(*a, **kw)
 
-            def _decode_unprofiled(*a, **kw):
+                def _decode_unprofiled(*a, **kw):
+                    if len(prof_t) == 1:
+                        torch.cuda.synchronize(); prof_t.append(time.perf_counter())
+                        prof.__exit__(None, None, None)
+                    return _vae_decode(*a, **kw)
+
+                pipe.model.forward, pipe.vae.decode = _forward_profiled, _decode_unprofiled
+            else:
+                prof.__enter__()
+        KV_RESET()
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        chunk = int(os.environ.get("CHUNK", "3"))
+        generate_fn = pipe.generate
+        stream_stats = None
+        if os.environ.get("STREAM") == "1":
+            from streaming import generate as stream_generate
+            stream_stats = {}
+            generate_fn = lambda *a, **kw: stream_generate(pipe, *a, stats=stream_stats, **kw)
+        if SAMPLE:
+            SAMPLE.start(tag, t0)
+        video = generate_fn(prompt, img, action_path=ACTION, chunk_size=chunk, max_area=int(os.environ.get("MAX_AREA", MAX_AREA_CONFIGS[args.size])),
+                            frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=int(os.environ.get("SEED", "42")), offload_model=False,
+                            **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        if prof is not None:
+            if os.environ.get("PROFILE_DIT") == "1":
+                pipe.model.forward, pipe.vae.decode = _model_fwd, _vae_decode
                 if len(prof_t) == 1:
-                    torch.cuda.synchronize(); prof_t.append(time.perf_counter())
-                    prof.__exit__(None, None, None)
-                return _vae_decode(*a, **kw)
-
-            pipe.model.forward, pipe.vae.decode = _forward_profiled, _decode_unprofiled
-        else:
-            prof.__enter__()
-    KV_RESET()
-    torch.cuda.synchronize(); t0 = time.perf_counter()
-    chunk = int(os.environ.get("CHUNK", "3"))
-    generate_fn = pipe.generate
-    stream_stats = None
-    if os.environ.get("STREAM") == "1":
-        from streaming import generate as stream_generate
-        stream_stats = {}
-        generate_fn = lambda *a, **kw: stream_generate(pipe, *a, stats=stream_stats, **kw)
-    video = generate_fn(prompt, img, action_path=EXAMPLE, chunk_size=chunk, max_area=MAX_AREA_CONFIGS[args.size],
-                        frame_num=int(os.environ.get("FRAMES", "97")), shift=args.sample_shift, seed=int(os.environ.get("SEED", "42")), offload_model=False,
-                        **({"timesteps_index": [int(v) for v in os.environ["STEPS_IDX"].split(",")]} if os.environ.get("STEPS_IDX") else {}))
-    torch.cuda.synchronize(); t1 = time.perf_counter()
-    if prof is not None:
-        if os.environ.get("PROFILE_DIT") == "1":
-            pipe.model.forward, pipe.vae.decode = _model_fwd, _vae_decode
-            if len(prof_t) == 1:
-                prof.__exit__(None, None, None); prof_t.append(t1)
-        else:
-            prof.__exit__(None, None, None); prof_t[:] = [t0, t1]
-        from kestrel.timeline import summarize
-        print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, prof_t[1] - prof_t[0])}), flush=True)
-    out = f"{OUT}/{os.path.basename(EXAMPLE)}_{tag}_c{chunk}.mp4"
-    save_video(tensor=video[None], save_file=out, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
-    if os.environ.get("TAE_LIVE") == "1" and TAE_STATS["n"]:
-        live = torch.cat(TAE_STATS["frames"], 0)
-        save_video(tensor=(live.permute(1, 0, 2, 3)[None] * 2 - 1), save_file=out.replace(".mp4", "_taelive.mp4"), fps=cfg.sample_fps,
-                   nrow=1, normalize=True, value_range=(-1, 1))
-        ts, tp = TAE_STATS["t_start"], TAE_STATS["t_pix"]
-        k = min(len(ts), len(tp))
-        s0 = min(4, k // 2)
-        rng = random.Random(0)
-        lo, hi = ts[s0], ts[k - 1]
-        lat = []
-        for _ in range(20000):
-            e = rng.uniform(lo, hi)
-            j = next(i for i in range(k) if ts[i] >= e)
-            lat.append(tp[j] - e)
-        lat.sort()
-        gen = [tp[i] - ts[i] for i in range(k)]
-        print(json.dumps({"exp": "tae_live", "latents": TAE_STATS["n"], "frames_out": int(live.shape[0]),
-                          "tae_ms_per_latent": round(TAE_STATS["ms"] / TAE_STATS["n"], 2),
-                          "chunk_start_to_first_pixel_ms_median": round(1e3 * sorted(gen[s0:])[len(gen[s0:]) // 2], 1),
-                          "input_to_pixels_ms": {"mean": round(1e3 * sum(lat) / len(lat), 1), "p50": round(1e3 * lat[len(lat) // 2], 1),
-                                                 "p95": round(1e3 * lat[int(0.95 * len(lat))], 1), "max": round(1e3 * lat[-1], 1)},
-                          "fps_e2e": round(4 * TAE_STATS["n"] / (tp[k - 1] - ts[0]), 2)}), flush=True)
-    print(json.dumps({"exp": "n1_e2e", "tag": tag, "generate_s": round(t1 - t0, 2), "out": out}), flush=True)
-    if stream_stats is not None:
-        print(json.dumps({"exp": "stream", "tag": tag, **stream_stats}), flush=True)
-    if CAM.get("mods"):
-        PATHS["cam_cache_hits"] = CAM["hits"]
-        PATHS["cam_cache_misses"] = CAM["miss"]
-    print(json.dumps({"exp": "paths", "tag": tag, **dict(sorted(PATHS.items()))}), flush=True)
-    PATHS.clear()
-    if GR:
-        GR.report(tag); GR.reset()
-    if not pipe.t5_cpu and next(pipe.text_encoder.model.parameters()).is_cuda:
-        pipe.text_encoder.model.cpu()
-        torch.cuda.empty_cache()
-    if calib:
-        after_calib()
-        if CALIB_FILE:
-            os.makedirs(os.path.dirname(CALIB_FILE), exist_ok=True)
-            json.dump([m.amax for m in mods], open(CALIB_FILE, "w"))
+                    prof.__exit__(None, None, None); prof_t.append(t1)
+            else:
+                prof.__exit__(None, None, None); prof_t[:] = [t0, t1]
+            from kestrel.timeline import summarize
+            print(json.dumps({"exp": "timeline", "tag": tag, **summarize(prof, prof_t[1] - prof_t[0])}), flush=True)
+        if SAMPLE and not calib:
+            SAMPLE.save(tag, video, t1)
+        out = f"{OUT}/{os.path.basename(EXAMPLE)}_{tag}_c{chunk}.mp4"
+        save_video(tensor=video[None], save_file=out, fps=cfg.sample_fps, nrow=1, normalize=True, value_range=(-1, 1))
+        if os.environ.get("TAE_LIVE") == "1" and TAE_STATS["n"]:
+            live = torch.cat(TAE_STATS["frames"], 0)
+            save_video(tensor=(live.permute(1, 0, 2, 3)[None] * 2 - 1), save_file=out.replace(".mp4", "_taelive.mp4"), fps=cfg.sample_fps,
+                       nrow=1, normalize=True, value_range=(-1, 1))
+            ts, tp = TAE_STATS["t_start"], TAE_STATS["t_pix"]
+            k = min(len(ts), len(tp))
+            s0 = min(4, k // 2)
+            rng = random.Random(0)
+            lo, hi = ts[s0], ts[k - 1]
+            lat = []
+            for _ in range(20000):
+                e = rng.uniform(lo, hi)
+                j = next(i for i in range(k) if ts[i] >= e)
+                lat.append(tp[j] - e)
+            lat.sort()
+            gen = [tp[i] - ts[i] for i in range(k)]
+            print(json.dumps({"exp": "tae_live", "latents": TAE_STATS["n"], "frames_out": int(live.shape[0]),
+                              "tae_ms_per_latent": round(TAE_STATS["ms"] / TAE_STATS["n"], 2),
+                              "chunk_start_to_first_pixel_ms_median": round(1e3 * sorted(gen[s0:])[len(gen[s0:]) // 2], 1),
+                              "input_to_pixels_ms": {"mean": round(1e3 * sum(lat) / len(lat), 1), "p50": round(1e3 * lat[len(lat) // 2], 1),
+                                                     "p95": round(1e3 * lat[int(0.95 * len(lat))], 1), "max": round(1e3 * lat[-1], 1)},
+                              "fps_e2e": round(4 * TAE_STATS["n"] / (tp[k - 1] - ts[0]), 2)}), flush=True)
+        print(json.dumps({"exp": "n1_e2e", "tag": tag, "generate_s": round(t1 - t0, 2), "out": out}), flush=True)
+        if stream_stats is not None:
+            print(json.dumps({"exp": "stream", "tag": tag, **stream_stats}), flush=True)
+        if CAM.get("mods"):
+            PATHS["cam_cache_hits"] = CAM["hits"]
+            PATHS["cam_cache_misses"] = CAM["miss"]
+        print(json.dumps({"exp": "paths", "tag": tag, **dict(sorted(PATHS.items()))}), flush=True)
+        PATHS.clear()
+        if GR:
+            GR.report(tag); GR.reset()
+        if not pipe.t5_cpu and next(pipe.text_encoder.model.parameters()).is_cuda:
+            pipe.text_encoder.model.cpu()
+            torch.cuda.empty_cache()
+        if calib:
+            after_calib()
+            if CALIB_FILE:
+                os.makedirs(os.path.dirname(CALIB_FILE), exist_ok=True)
+                json.dump([m.amax for m in mods], open(CALIB_FILE, "w"))
