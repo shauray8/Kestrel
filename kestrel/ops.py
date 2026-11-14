@@ -37,3 +37,6 @@ def vm():
 
 def nomas_glue():
     return _ext("nomas_glue")
+
+def iquant():
+    return _ext("iquant")
