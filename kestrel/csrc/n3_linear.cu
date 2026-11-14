@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -68,7 +69,7 @@ __device__ __forceinline__ void residual_pair(float *out, size_t off, float a, f
   out[off + 1] = __fadd_rn(out[off + 1], g ? __fmul_rn(yf.y, g[1]) : yf.y);
 }
 
-template <int S, int EPI, bool Cont>
+template <int S, int EPI, bool Cont, bool PDL>
 __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, const __grid_constant__ CUtensorMap bmap,
                                      const float *__restrict__ sw, const __nv_bfloat16 *__restrict__ bias,
                                      void *__restrict__ out, int M, int N, int K, float sa, float out_inv, Gate gate, int split) {
@@ -94,10 +95,21 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
         init_bar(full + s, 1); init_bar(empty + s, 8);
       }
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      if constexpr (PDL)
+        if (!reinit) {
+          asm volatile("prefetch.tensormap [%0];" :: "l"(&amap) : "memory");
+          asm volatile("prefetch.tensormap [%0];" :: "l"(&bmap) : "memory");
+        }
     }
     __syncthreads();
   };
+  bool dependency_ready = !PDL;
   auto produce = [&](int m0, int n0, int base) {
+    if constexpr (PDL)
+      if (!dependency_ready) {
+        cudaGridDependencySynchronize();
+        dependency_ready = true;
+      }
     for (int kt = 0; kt < kt_count; ++kt) {
       const int g = base + kt, s = g % S;
       if (g >= S) wait_bar(empty + s, ((g / S) - 1) & 1);
@@ -106,7 +118,7 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
       tma(sB + s * BB, &bmap, full + s, kt * BK, n0);
     }
   };
-  auto consume = [&](int m0, int n0, int base) {
+  auto consume = [&](int m0, int n0, int base, bool last) {
     const int wm = warp / 4, wn = warp % 4, mi_l = lane >> 3, r = lane & 7;
     uint32_t h[MI][NJ][2];
     float f[MI][NJ][4];
@@ -142,6 +154,8 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
       if (lane == 0) arrive(empty + s);
     }
     promote(h, f);
+    if constexpr (PDL)
+      if (last) cudaTriggerProgrammaticLaunchCompletion();
     const int g = lane >> 2, t4 = lane & 3;
 #pragma unroll
     for (int j = 0; j < NJ; ++j) {
@@ -186,7 +200,7 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
     for (int pid = blockIdx.x, base = 0; pid < tiles; pid += gridDim.x, base += kt_count) {
       int m0, n0;
       tile(pid, m0, n0);
-      consume(m0, n0, base);
+      consume(m0, n0, base, pid + gridDim.x >= tiles);
     }
   } else {
     for (int pid = blockIdx.x; pid < tiles; pid += gridDim.x) {
@@ -199,7 +213,7 @@ __global__ void __maxnreg__(160) gemm(const __grid_constant__ CUtensorMap amap, 
         asm volatile("bar.sync 1, 128;" ::: "memory");
         asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
       } else {
-        consume(m0, n0, 0);
+        consume(m0, n0, 0, pid + gridDim.x >= tiles);
       }
       __syncthreads();
     }
@@ -241,19 +255,41 @@ CUtensorMap encode(const torch::Tensor &x, int rows, int k) {
   return map;
 }
 
-template <int S, int EPI, bool Cont>
+template <int S, int EPI, bool Cont, bool PDL = false>
 void launch(CUtensorMap a, CUtensorMap b, const torch::Tensor &sw, const __nv_bfloat16 *bias, torch::Tensor &y,
             int m, int n, int k, float sa, float inv, Gate gate, int split) {
+  if constexpr (!PDL) {
+    const char *pdl = std::getenv("N3_PDL");
+    if (pdl && std::atoi(pdl) == 1) {
+      launch<S, EPI, Cont, true>(a, b, sw, bias, y, m, n, k, sa, inv, gate, split);
+      return;
+    }
+  }
   constexpr int bytes = S * (AB + BB) + 2 * S * sizeof(uint64_t);
   static thread_local int initialized_device = -1;
   if (initialized_device != sw.get_device()) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(gemm<S, EPI, Cont>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(gemm<S, EPI, Cont, PDL>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     initialized_device = sw.get_device();
   }
   const int tiles = ((m + BM - 1) / BM) * (n / BN);
   const int blocks = std::min(tiles, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
-  gemm<S, EPI, Cont><<<blocks, THREADS, bytes, at::cuda::getCurrentCUDAStream()>>>(a, b, sw.data_ptr<float>(), bias,
-      y.data_ptr(), m, n, k, sa, inv, gate, split);
+  if constexpr (PDL) {
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(blocks);
+    cfg.blockDim = dim3(THREADS);
+    cfg.dynamicSmemBytes = bytes;
+    cfg.stream = at::cuda::getCurrentCUDAStream();
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, gemm<S, EPI, Cont, PDL>, a, b, sw.data_ptr<float>(), bias,
+                                    y.data_ptr(), m, n, k, sa, inv, gate, split));
+  } else {
+    gemm<S, EPI, Cont, PDL><<<blocks, THREADS, bytes, at::cuda::getCurrentCUDAStream()>>>(a, b, sw.data_ptr<float>(), bias,
+        y.data_ptr(), m, n, k, sa, inv, gate, split);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -326,6 +362,80 @@ torch::Tensor linear_f8(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10:
 torch::Tensor linear_f8_gelu(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, double so) { return run<false, 1>(x, w, sw, b, sa, so); }
 torch::Tensor linear_residual(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, torch::Tensor residual, c10::optional<torch::Tensor> gate) { return run<true, 2>(x, w, sw, b, sa, 1.0, residual, gate); }
 torch::Tensor linear_f8_residual(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, torch::Tensor residual, c10::optional<torch::Tensor> gate) { return run<false, 2>(x, w, sw, b, sa, 1.0, residual, gate); }
+__global__ void silu_mul_q(const __nv_bfloat16 *__restrict__ g, const __nv_bfloat16 *__restrict__ u, uint8_t *__restrict__ y, size_t count, float inv) {
+  const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+  if (i >= count) return;
+  const uint4 rg = *reinterpret_cast<const uint4 *>(g + i), ru = *reinterpret_cast<const uint4 *>(u + i);
+  const uint32_t wg[4] = {rg.x, rg.y, rg.z, rg.w}, wu[4] = {ru.x, ru.y, ru.z, ru.w};
+  uint16_t p[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&wg[j]));
+    const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&wu[j]));
+    const float2 s = __bfloat1622float2(__floats2bfloat162_rn(a.x / (1.f + expf(-a.x)), a.y / (1.f + expf(-a.y))));
+    const float2 h = __bfloat1622float2(__floats2bfloat162_rn(s.x * b.x, s.y * b.y));
+    p[j] = q2(h.x, h.y, inv);
+  }
+  *reinterpret_cast<uint2 *>(y + i) = make_uint2(p[0] | (uint32_t(p[1]) << 16), p[2] | (uint32_t(p[3]) << 16));
+}
+
+__global__ void silu_mul_q_cols(const __nv_bfloat16 *__restrict__ gu, const float *__restrict__ sw, uint8_t *__restrict__ y,
+                                int rows, int inter, float inv) {
+  const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
+  if (i >= (size_t)rows * inter) return;
+  const size_t r = i / inter; const int c = int(i % inter);
+  const __nv_bfloat16 *g = gu + r * 2 * inter + c, *u = g + inter;
+  const uint4 rg = *reinterpret_cast<const uint4 *>(g), ru = *reinterpret_cast<const uint4 *>(u);
+  const uint32_t wg[4] = {rg.x, rg.y, rg.z, rg.w}, wu[4] = {ru.x, ru.y, ru.z, ru.w};
+  uint16_t p[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 a0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&wg[j]));
+    const float2 b0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&wu[j]));
+    const float2 a = __bfloat1622float2(__floats2bfloat162_rn(a0.x * sw[c + 2 * j], a0.y * sw[c + 2 * j + 1]));
+    const float2 b = __bfloat1622float2(__floats2bfloat162_rn(b0.x * sw[inter + c + 2 * j], b0.y * sw[inter + c + 2 * j + 1]));
+    const float2 s = __bfloat1622float2(__floats2bfloat162_rn(a.x / (1.f + expf(-a.x)), a.y / (1.f + expf(-a.y))));
+    const float2 h = __bfloat1622float2(__floats2bfloat162_rn(s.x * b.x, s.y * b.y));
+    p[j] = q2(h.x, h.y, inv);
+  }
+  *reinterpret_cast<uint2 *>(y + i) = make_uint2(p[0] | (uint32_t(p[1]) << 16), p[2] | (uint32_t(p[3]) << 16));
+}
+
+torch::Tensor silu_mul_quant_cols(torch::Tensor gu, torch::Tensor sw, double sa) {
+  TORCH_CHECK(gu.is_cuda() && gu.is_contiguous() && gu.scalar_type() == torch::kBFloat16 && gu.dim() == 2 && gu.size(1) % 16 == 0, "gu");
+  TORCH_CHECK(sw.is_cuda() && sw.scalar_type() == torch::kFloat32 && sw.is_contiguous() && sw.numel() == gu.size(1), "sw");
+  const c10::cuda::CUDAGuard guard(gu.device());
+  const int rows = gu.size(0), inter = gu.size(1) / 2;
+  auto a = torch::empty({rows, inter}, gu.options().dtype(torch::kFloat8_e4m3fn));
+  const size_t n = a.numel();
+  if (n) silu_mul_q_cols<<<(n + 2047) / 2048, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(gu.data_ptr()), sw.data_ptr<float>(), reinterpret_cast<uint8_t *>(a.data_ptr()), rows, inter, float(1.0 / sa));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return a;
+}
+
+torch::Tensor quantize_bf16(torch::Tensor x, double sa) {
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kBFloat16 && x.numel() % 8 == 0, "x");
+  const c10::cuda::CUDAGuard guard(x.device());
+  auto a = torch::empty(x.sizes(), x.options().dtype(torch::kFloat8_e4m3fn));
+  if (x.numel()) quantize<<<(x.numel() + 2047) / 2048, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr()), reinterpret_cast<uint8_t *>(a.data_ptr()), x.numel(), float(1.0 / sa));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return a;
+}
+
+torch::Tensor silu_mul_quant(torch::Tensor gu, double sa) {
+  TORCH_CHECK(gu.is_cuda() && gu.is_contiguous() && gu.scalar_type() == torch::kBFloat16 && gu.dim() == 3 && gu.size(0) == 2 && gu.size(2) % 8 == 0, "gu");
+  const c10::cuda::CUDAGuard guard(gu.device());
+  auto a = torch::empty({gu.size(1), gu.size(2)}, gu.options().dtype(torch::kFloat8_e4m3fn));
+  const size_t n = a.numel();
+  if (n) silu_mul_q<<<(n + 2047) / 2048, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(gu.data_ptr()), reinterpret_cast<const __nv_bfloat16 *>(gu.data_ptr()) + n,
+      reinterpret_cast<uint8_t *>(a.data_ptr()), n, float(1.0 / sa));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return a;
+}
+
 torch::Tensor linear_split(torch::Tensor x, torch::Tensor w, torch::Tensor sw, c10::optional<torch::Tensor> b, double sa, int64_t split) { return run<true, 0>(x, w, sw, b, sa, 1.0, c10::nullopt, c10::nullopt, int(split)); }
 }
 
@@ -337,4 +447,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("n3_linear_residual", &linear_residual);
   m.def("n3_linear_f8in_residual", &linear_f8_residual);
   m.def("n3_linear_split", &linear_split);
+  m.def("n3_quantize", &quantize_bf16);
+  m.def("n3_silu_mul_quant", &silu_mul_quant);
+  m.def("n3_silu_mul_quant_cols", &silu_mul_quant_cols);
 }
