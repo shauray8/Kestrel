@@ -269,8 +269,69 @@ def _patch_dit():
                     setattr(module, key, load)
 
 
+def _cached(module):
+    if not isinstance(module, N3Linear):
+        return None
+    entry = _SCALES.get((module.activation_scale.device, module.activation_scale.data_ptr()))
+    return entry[1] if entry is not None and entry[0]() is not None else None
+
+
+def dec_qkv(attention, x):
+    mods = attention.q_proj, attention.k_proj, attention.v_proj
+    scales = [_cached(m) for m in mods]
+    if os.environ.get("NOMAS_DEC_FUSE") != "1" or scales[0] is None or len(set(scales)) != 1 or not x.is_contiguous():
+        return [m(x) for m in mods]
+    ext = ops.n3()
+    x8 = ext.n3_quantize(x.bfloat16(), scales[0])
+    return [ext.n3_linear_f8in(x8, m.wq, m.sw, m.bias, scales[0]) for m in mods]
+
+
+def _fuse_gate_up(mlp):
+    g, u = mlp.gate_proj, mlp.up_proj
+    w, s = torch.cat((g.wq, u.wq)), torch.cat((g.sw, u.sw))
+    n = g.wq.shape[0]
+    g._buffers["wq"], u._buffers["wq"], g._buffers["sw"], u._buffers["sw"] = w[:n], w[n:], s[:n], s[n:]
+    mlp._nomas_gu = (w, s, n)
+
+
+def dec_mlp(mlp, x):
+    g, u, d = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+    sg, su, sd = _cached(g), _cached(u), _cached(d)
+    if (os.environ.get("NOMAS_DEC_FUSE") != "1" or sg is None or sg != su or sd is None or not x.is_contiguous()
+            or g.bias is not None or u.bias is not None or g.wq.shape[0] % 128):
+        y = d(torch.nn.functional.silu(g(x)) * u(x))
+        if (os.environ.get("NOMAS_DEC_FUSE") == "1" and not hasattr(mlp, "_nomas_gu") and not torch.cuda.is_current_stream_capturing()
+                and _cached(g) is not None and _cached(g) == _cached(u) and g.bias is None and u.bias is None):
+            _fuse_gate_up(mlp)
+            mlp._nomas_cublas = (torch.tensor(_cached(g), device=x.device), torch.tensor(_cached(d), device=x.device),
+                                 torch.ones((), device=x.device), d.sw.view(1, -1).bfloat16())
+        return y
+    if not hasattr(mlp, "_nomas_gu"):
+        if torch.cuda.is_current_stream_capturing():
+            return d(torch.nn.functional.silu(g(x)) * u(x))
+        _fuse_gate_up(mlp)
+    w, s, n = mlp._nomas_gu
+    ext = ops.n3()
+    if os.environ.get("NOMAS_DEC_CUBLAS") == "1" and d.bias is None:
+        x8 = ext.n3_quantize(x.bfloat16().reshape(-1, x.shape[-1]).contiguous(), sg)
+        st = mlp.__dict__.get("_nomas_cublas")
+        if st is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("NOMAS_DEC_CUBLAS scales must be prepared before graph capture")
+            st = mlp.__dict__["_nomas_cublas"] = (torch.tensor(sg, device=x.device), torch.tensor(sd, device=x.device),
+                                                  torch.ones((), device=x.device), d.sw.view(1, -1).bfloat16())
+        gu = torch._scaled_mm(x8, w.t(), scale_a=st[0], scale_b=st[2], out_dtype=torch.bfloat16)
+        h = ext.n3_silu_mul_quant_cols(gu, s, sd)
+        y = torch._scaled_mm(h, d.wq.t(), scale_a=st[1], scale_b=st[2], out_dtype=torch.bfloat16)
+        return y.mul_(st[3]).view(*x.shape[:-1], d.out_features)
+    gu = ext.n3_linear_split(x.bfloat16().reshape(-1, x.shape[-1]), w, s, None, sg, n)
+    h = ext.n3_silu_mul_quant(gu, sd)
+    return ext.n3_linear_f8in(h, d.wq, d.sw, d.bias, sd).view(*x.shape[:-1], d.out_features)
+
+
 def _patch_decoder():
-    from hymm.models.vae.pixelumm_decoder import loader
+    from hymm.models.vae.pixelumm_decoder import loader, model
+    model.GenMLP.forward = lambda self, x: dec_mlp(self, x)
 
     original = loader._install_inference_optimizations
     class Config:

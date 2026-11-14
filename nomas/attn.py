@@ -258,6 +258,37 @@ def _decoder_plan(grid, tile, device):
     return result
 
 
+def _paged_plan(grid, tile, device):
+    frames, height, width = grid
+    nh, nw = (height+tile-1)//tile, (width+tile-1)//tile
+    spans, blocks, index, cursor, nb, groups = {}, {}, [], 0, 0, {}
+    for y in range(nh):
+        for x in range(nw):
+            length = frames * min(tile, height-y*tile) * min(tile, width-x*tile)
+            spans[y, x] = (cursor, cursor+length)
+            n = -(-length // 64)
+            blocks[y, x] = (nb, n, length)
+            index.extend(range(cursor, cursor+length))
+            index.extend([cursor+length-1] * (n*64 - length))
+            cursor += length
+            nb += n
+            center = (min(max(y, 1), max(nh-2, 1)), min(max(x, 1), max(nw-2, 1)))
+            groups.setdefault(center, []).append((y, x))
+    result = []
+    for (cy, cx), tiles in groups.items():
+        qi = _indices([spans[t] for t in tiles], device)
+        tab, val = [], []
+        for y in range(max(0, cy-1), min(nh, cy+2)):
+            for x in range(max(0, cx-1), min(nw, cx+2)):
+                first, n, length = blocks[y, x]
+                tab.extend(range(first, first+n))
+                val.extend([64] * (n-1) + [length - 64*(n-1)])
+        result.append((qi, torch.tensor(tab, dtype=torch.int32, device=device),
+                       torch.tensor(val, dtype=torch.int32, device=device)))
+    return {"index": torch.tensor(index, dtype=torch.long, device=device), "blocks": nb,
+            "count": cursor, "all": torch.arange(cursor, device=device), "groups": result}
+
+
 def decoder_attention(q, k, v, block_mask=None):
     if q.shape[2] % k.shape[2]:
         raise ValueError("Decoder Q heads must be divisible by KV heads")
@@ -292,15 +323,17 @@ def _install_decoder():
     def local_attention_layout(grid, tile, device):
         result = layout(grid, tile, device)
         if result is not None and id(result[2]) not in _LAYOUTS:
-            _LAYOUTS[id(result[2])] = (result[2], _decoder_plan(grid, tile, device))
+            _LAYOUTS[id(result[2])] = (result[2], _decoder_plan(grid, tile, device), _paged_plan(grid, tile, device))
         return result
     @torch.compiler.disable
     def forward(self, x, cos, sin, block_mask=None):
         arch = self.arch
         batch, count, _ = x.shape
-        q = self.q_proj(x).view(batch, count, arch.num_heads, arch.head_dim)
-        k = self.k_proj(x).view(batch, count, arch.num_kv_heads, arch.head_dim)
-        v = self.v_proj(x).view(batch, count, arch.num_kv_heads, arch.head_dim)
+        from .gemm import dec_qkv
+        q, k, v = dec_qkv(self, x)
+        q = q.view(batch, count, arch.num_heads, arch.head_dim)
+        k = k.view(batch, count, arch.num_kv_heads, arch.head_dim)
+        v = v.view(batch, count, arch.num_kv_heads, arch.head_dim)
         q = self._prepare_qk(q, cos, sin, self.q_norm_t, self.q_norm_hw, v.dtype)
         k = self._prepare_qk(k, cos, sin, self.k_norm_t, self.k_norm_hw, v.dtype)
         out = decoder_attention(q, k, v, block_mask)

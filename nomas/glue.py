@@ -15,7 +15,7 @@ _GRAPH_PACKED = contextvars.ContextVar("nomas_glue_graph_packed", default=None)
 _CUDA = os.environ.get("NOMAS_GLUE_CUDA", "0") == "1"
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["L"])
 def _mod_kernel(X, S, A, Y, C: tl.constexpr, L,
                 SS, AS, EPS: tl.constexpr,
                 INV, FP8: tl.constexpr, NORM_FP32: tl.constexpr, BLOCK: tl.constexpr):
@@ -115,7 +115,7 @@ def _add_rms_fake(x, residual, weight, eps):
     return torch.empty_like(x), torch.empty_like(x, dtype=torch.promote_types(x.dtype, weight.dtype))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["L"])
 def _rope_kernel(X, W, U, COS, SIN, Y, H: tl.constexpr, D: tl.constexpr,
                  L, EPS: tl.constexpr, DEC: tl.constexpr,
                  ROPE: tl.constexpr, WF32: tl.constexpr):
@@ -312,7 +312,7 @@ def _source(CACHE, SCALE, IMG, TXT, IDX, r, d, head, H: tl.constexpr,
     return tl.where(token[:, None] < HIST, a, tl.where(token[:, None] < HIST + NI, b, c))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["HIST", "NI", "NK", "NB", "FIRST"])
 def _indexed_quant(CACHE, SCALE, IMG, TXT, IDX, OUT, S, MEAN,
                    H: tl.constexpr, HIST, NI,
                    CS, SS, INT8: tl.constexpr,
@@ -340,7 +340,7 @@ def _indexed_quant(CACHE, SCALE, IMG, TXT, IDX, OUT, S, MEAN,
     tl.store(S + head * NB + block, scale)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["HIST", "N"])
 def _history_mean(CACHE, SCALE, IDX, OUT, H: tl.constexpr, HIST,
                   CS, SS, INT8: tl.constexpr,
                   N):
@@ -356,6 +356,11 @@ def _history_mean(CACHE, SCALE, IDX, OUT, H: tl.constexpr, HIST,
 
 
 def _quant(grid, *args, **kwargs):
+    mode = os.environ.get("NOMAS_IQUANT")
+    if mode in ("1", "fast") or (mode == "v" and args[17]):
+        a = args
+        return ops.iquant().indexed_quant(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], grid[1], a[8], a[9], a[10],
+            a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18] if len(a) > 18 else 1, os.environ["NOMAS_IQUANT"] == "fast")
     if _CUDA:
         return ops.nomas_glue().indexed_quant(*args)
     return _indexed_quant[grid](*args, **kwargs)
@@ -421,9 +426,28 @@ def _direct_group(q, k, v, cache, length, qi, ki, history):
         0, False, count, st["q8"].shape[1], 0, False, enable_fp_fusion=False)
     engine = _engine()
     engine.stats["calls"] += 1
+    splits = _splits(triton.cdiv(count, 128) * h, nb) if os.environ.get("NOMAS_FA_SPLIT") == "1" and engine.q_tile == 128 else 1
+    if splits > 1:
+        tab = torch.arange(nb, device=q[0].device, dtype=torch.int32)
+        val = torch.full((nb,), 64, device=q[0].device, dtype=torch.int32)
+        val[-1:].fill_(nk - (nb - 1) * 64)
+        ws = torch.empty(splits * h * count * 130, device=q[0].device)
+        return ext.fa_attention_split(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"], tab, val,
+            count, splits, 128 ** -.5, engine.exp_mode, engine.rescale_threshold, st["plan"], ws)
     return ext.fa_attention(st["q8"], st["k8"], st["v8"], st["qs"], st["ks"], st["vs"],
         count, nk, 128 ** -.5, engine.load_mode, engine.exp_mode, engine.rescale_threshold,
         st["plan"], engine.q_tile, engine.mx, engine.bal, True, True)
+
+
+def _splits(ctas, blocks, sms=170):
+    best, cost = 1, -(-ctas // sms)
+    for s in range(2, 9):
+        if blocks < 4 * s:
+            break
+        c = -(-ctas * s // sms) / s * (1 + 0.03 * s)
+        if c < 0.9 * cost:
+            best, cost = s, c
+    return best
 
 
 def _groups(img_len, txt_mask, history_mask, length, offsets, windows):
@@ -555,7 +579,7 @@ def _attention(q, k, v, kv_cache, cache_valid_len=0, attn_mode=None,
     return out[:, :ni].reshape(1, ni, -1), out[:, ni:].reshape(1, nt, -1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "SPATIAL", "TOTAL"])
 def _camera_add_kernel(X, F, M, Y, C: tl.constexpr, T,
                        SPATIAL, TOTAL,
                        MASK: tl.constexpr, BLOCK: tl.constexpr):
@@ -691,6 +715,51 @@ def _preprocess_camera(self, norm_extrinsics, norm_intrinsics, action_onehot,
     return state["value"]
 
 
+_PAGED = {}
+_DUMPED = [0, 0]
+
+
+def _paged_buffers(device, heads, nb):
+    key = device, heads, nb
+    st = _PAGED.get(key)
+    if st is None:
+        st = {"k8": torch.empty((heads, nb, 64, 128), dtype=torch.uint8, device=device),
+              "v8": torch.empty((heads, nb, 128, 64), dtype=torch.uint8, device=device),
+              "ks": torch.empty((heads, nb), device=device), "vs": torch.empty((heads, nb), device=device)}
+        st["plan"] = ops.fa().fa_plan(st["k8"], st["v8"])
+        _PAGED[key] = st
+    return st
+
+
+def _decoder_paged(q, k, v, paged):
+    from . import attn
+    output = torch.empty_like(q)
+    heads, kv_heads = q.shape[2], k.shape[2]
+    engine, ext = attn._engine(), ops.fa()
+    nb, count, index = paged["blocks"], paged["count"], paged["index"]
+    st = _paged_buffers(q.device, heads, nb)
+    for batch in range(q.shape[0]):
+        partial = torch.empty((triton.cdiv(count, 128), kv_heads, 128), device=k.device)
+        _mean((kv_heads, partial.shape[0]), k[batch], k[batch], paged["all"], partial,
+            kv_heads, 0, k.stride(1), 0, False, count, enable_fp_fusion=False)
+        mean = partial.sum(0)
+        for source, name, scales, value in ((k, "k8", "ks", False), (v, "v8", "vs", True)):
+            _quant((nb, heads), source[batch], source[batch], source[batch], source[batch], index,
+                st[name], st[scales], mean, kv_heads, 0, source.shape[1], source.stride(1), 0, False,
+                index.numel(), nb, 0, value, heads // kv_heads, enable_fp_fusion=False)
+        for qi, tab, val in paged["groups"]:
+            n = qi.numel()
+            qb = _buffers(q, 64, n)
+            _quant((qb["q8"].shape[1], heads), q[batch], q[batch], q[batch], q[batch], qi,
+                qb["q8"], qb["qs"], qb["zero"], heads, 0, q.shape[1], q.stride(1), 0, False,
+                n, qb["q8"].shape[1], 0, False, 1, enable_fp_fusion=False)
+            part = ext.fa_attention_paged(qb["q8"], st["k8"], st["v8"], qb["qs"], st["ks"], st["vs"],
+                tab, val, n, 128 ** -.5, engine.exp_mode, engine.rescale_threshold, st["plan"], engine.q_tile)
+            engine.stats["calls"] += 1
+            output[batch].index_copy_(0, qi, part)
+    return output
+
+
 def _decoder_attention(q, k, v, block_mask=None):
     from . import attn
     attn._check(q, k, v, gqa=True)
@@ -699,6 +768,12 @@ def _decoder_attention(q, k, v, block_mask=None):
     entry = attn._LAYOUTS.get(id(block_mask))
     if entry is None or entry[0] is not block_mask:
         raise ValueError("Decoder mask was not built by PixelUMM local_attention_layout")
+    dump = os.environ.get("NOMAS_DEC_DUMP")
+    if dump and _DUMPED[0] < 6 and _DUMPED.__setitem__(1, _DUMPED[1] + 1) is None and _DUMPED[1] % 7 == 1:
+        torch.save({"q": q, "k": k, "v": v, "plan": entry[1], "paged": entry[2]}, f"{dump}/dec_{_DUMPED[0]}.pt")
+        _DUMPED[0] += 1
+    if os.environ.get("NOMAS_DEC_PAGED") == "1" and len(entry) > 2:
+        return _decoder_paged(q, k, v, entry[2])
     output = torch.empty_like(q)
     heads, kv_heads = q.shape[2], k.shape[2]
     engine, ext = attn._engine(), ops.fa()
