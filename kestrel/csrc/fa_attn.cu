@@ -334,18 +334,54 @@ __device__ __forceinline__ void fa_store(const float (&o)[16][4], float l0, floa
   }
 }
 
-template <int Load, int Exp, int QTile, bool Mx = false, bool I8 = false>
+__device__ __forceinline__ void fa_store_part(const float (&o)[16][4], float m0, float m1, float l0, float l1, int row0, int lane, int Lq, int H,
+                                              int head, float *__restrict__ ws) {
+  const int row1 = row0 + 8, t4 = lane & 3, z = blockIdx.z;
+  float *ob = ws + (size_t(z) * H + head) * Lq * D, *ml = ws + size_t(gridDim.z) * H * Lq * D + (size_t(z) * H + head) * Lq * 2;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const int col = j * 8 + t4 * 2;
+    if (row0 < Lq) *reinterpret_cast<float2 *>(ob + size_t(row0) * D + col) = make_float2(o[j][0], o[j][1]);
+    if (row1 < Lq) *reinterpret_cast<float2 *>(ob + size_t(row1) * D + col) = make_float2(o[j][2], o[j][3]);
+  }
+  if (t4 == 0) {
+    if (row0 < Lq) *reinterpret_cast<float2 *>(ml + size_t(row0) * 2) = make_float2(m0, l0);
+    if (row1 < Lq) *reinterpret_cast<float2 *>(ml + size_t(row1) * 2) = make_float2(m1, l1);
+  }
+}
+
+__global__ void fa_combine(const float *__restrict__ ws, __nv_bfloat16 *__restrict__ O, int Lq, int H, int S) {
+  const int row = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
+  const float *ml = ws + size_t(S) * H * Lq * D;
+  float M = -INFINITY;
+  for (int z = 0; z < S; ++z) M = fmaxf(M, ml[((size_t(z) * H + head) * Lq + row) * 2]);
+  float L = 0.f, acc = 0.f;
+  for (int z = 0; z < S; ++z) {
+    const float m = ml[((size_t(z) * H + head) * Lq + row) * 2], w = m == -INFINITY ? 0.f : exp2f(m - M);
+    L = fmaf(ml[((size_t(z) * H + head) * Lq + row) * 2 + 1], w, L);
+    acc = fmaf(ws[((size_t(z) * H + head) * Lq + row) * D + d], w, acc);
+  }
+  O[(size_t(row) * H + head) * D + d] = __float2bfloat16_rn(acc / L);
+}
+
+template <int Load, int Exp, int QTile, bool Mx = false, bool I8 = false, bool Pg = false, bool Part = false>
 __global__ void __launch_bounds__(QTile * 2 + (Load == 3 ? 32 : 0), QTile == 64 ? 2 : 1)
 fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const uint8_t *__restrict__ V,
           const float *__restrict__ QS, const float *__restrict__ KS, const float *__restrict__ VS,
           void *__restrict__ O, bool obf, int Lq, int Lk, int H, float scale_log2, float threshold,
-          const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap) {
+          const __grid_constant__ CUtensorMap kmap, const __grid_constant__ CUtensorMap vmap,
+          const int *__restrict__ TAB = nullptr, const int *__restrict__ VAL = nullptr, int NB = 0, float *__restrict__ WS = nullptr) {
   constexpr int W = QTile / 16, NT = W * 32, S = stages(QTile);
   extern __shared__ __align__(1024) uint8_t smem[];
   uint8_t *sQ = smem, *sK = sQ + QTile * D, *sV = sK + S * TILE;
   uint64_t *ready = reinterpret_cast<uint64_t *>(sV + S * TILE), *empty = ready + S;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.y, q0 = blockIdx.x * QTile;
-  const int nq = (Lq + BK - 1) / BK, nk = (Lk + BK - 1) / BK;
+  const int nq = (Lq + BK - 1) / BK;
+  int nk = (Lk + BK - 1) / BK;
+  if constexpr (Part) {
+    const int a = int(blockIdx.z) * nk / int(gridDim.z), b = (int(blockIdx.z) + 1) * nk / int(gridDim.z);
+    TAB += a; VAL += a; nk = b - a;
+  }
   if (tid < NT) {
 #pragma unroll
     for (int j = 0; j < QTile * D / 16 / NT; ++j) {
@@ -364,9 +400,10 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
   __syncthreads();
   auto issue_tma = [&](int kb) {
     const int buf = kb % S;
+    const int pb = Pg ? TAB[kb] : kb;
     expect(ready + buf);
-    tma_load(&kmap, sK + buf * TILE, ready + buf, kb * BK, head);
-    tma_load(&vmap, sV + buf * TILE, ready + buf, kb * D, head);
+    tma_load(&kmap, sK + buf * TILE, ready + buf, pb * BK, head);
+    tma_load(&vmap, sV + buf * TILE, ready + buf, pb * D, head);
   };
   auto issue_cp = [&](int kb) {
     const int buf = kb % S;
@@ -422,14 +459,21 @@ fa_kernel(const uint8_t *__restrict__ Q, const uint8_t *__restrict__ K, const ui
         if (!tid && kb + S - 1 < nk) issue_tma(kb + S - 1);
       }
     }
-    fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS + head * nk + kb, VS + head * nk + kb, threshold, lane,
-                     o, m0, m1, l0, l1);
+    if constexpr (Pg) {
+      const int pb = TAB[kb];
+      fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, 0, VAL[kb], qs, KS + head * NB + pb, VS + head * NB + pb, threshold, lane,
+                       o, m0, m1, l0, l1);
+    } else {
+      fa_step<Exp, Mx, I8>(qa, sK + buf * TILE, sV + buf * TILE, kb, Lk, qs, KS + head * nk + kb, VS + head * nk + kb, threshold, lane,
+                       o, m0, m1, l0, l1);
+    }
     if constexpr (Load == 3) {
       __syncwarp();
       if (!lane) arrive(empty + buf);
     }
   }
-  fa_store(o, l0, l1, q0 + warp * 16 + g, lane, Lq, H, head, O, obf);
+  if constexpr (Part) fa_store_part(o, m0, m1, l0, l1, q0 + warp * 16 + g, lane, Lq, H, head, WS);
+  else fa_store(o, l0, l1, q0 + warp * 16 + g, lane, Lq, H, head, O, obf);
 }
 
 __device__ __forceinline__ void bar_compute(int n) { asm volatile("bar.sync 1, %0;" :: "r"(n) : "memory"); }
@@ -709,7 +753,71 @@ torch::Tensor fa_attention(torch::Tensor q, torch::Tensor k, torch::Tensor v, to
   return out;
 }
 
+torch::Tensor fa_attention_paged(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor qs, torch::Tensor ks, torch::Tensor vs,
+                                  torch::Tensor tab, torch::Tensor val, int Lq, double sm_scale, int exp_mode, double rescale_threshold,
+                                  torch::Tensor plan, int q_tile) {
+  check_packed(q, "q"); check_packed(k, "k"); check_packed(v, "v");
+  const c10::cuda::CUDAGuard guard(q.device());
+  const int H = q.size(0), nq = (Lq + BK - 1) / BK, NB = k.size(1), nblk = tab.numel();
+  TORCH_CHECK(Lq > 0 && nblk > 0 && q.size(1) == nq && v.size(1) == NB && k.size(0) == H && v.size(0) == H, "invalid paged lengths");
+  TORCH_CHECK(tab.is_cuda() && val.is_cuda() && tab.scalar_type() == torch::kInt32 && val.scalar_type() == torch::kInt32
+              && tab.is_contiguous() && val.is_contiguous() && val.numel() == nblk && tab.device() == q.device(), "invalid block table");
+  TORCH_CHECK(qs.size(1) == nq && ks.size(1) == NB && vs.size(1) == NB, "invalid paged scales");
+  TORCH_CHECK(q_tile == 64 || q_tile == 128, "q_tile must be 64 or 128");
+  TORCH_CHECK(plan.device().is_cpu() && plan.numel() == 2 * sizeof(CUtensorMap), "invalid TMA plan");
+  CUtensorMap km{}, vm{};
+  std::memcpy(&km, plan.data_ptr(), sizeof(km));
+  std::memcpy(&vm, plan.data_ptr<uint8_t>() + sizeof(km), sizeof(vm));
+  auto out = torch::empty({Lq, H, D}, q.options().dtype(torch::kBFloat16));
+  const float sl = float(sm_scale) * 1.4426950408889634f, th = rescale_threshold;
+  auto go = [&](auto kern, int qt) {
+    const int nt = qt * 2 + 32, smem = qt * D + 2 * stages(qt) * TILE + 64;
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kern<<<dim3((Lq + qt - 1) / qt, H), nt, smem, at::cuda::getCurrentCUDAStream()>>>(
+      q.data_ptr<uint8_t>(), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(), qs.data_ptr<float>(), ks.data_ptr<float>(), vs.data_ptr<float>(),
+      out.data_ptr(), true, Lq, nblk * BK, H, sl, th, km, vm, tab.data_ptr<int>(), val.data_ptr<int>(), NB, nullptr);
+  };
+  if (q_tile == 64) {
+    if (exp_mode == 0) go(fa_kernel<3, 0, 64, true, true, true>, 64); else if (exp_mode == 1) go(fa_kernel<3, 1, 64, true, true, true>, 64); else go(fa_kernel<3, 2, 64, true, true, true>, 64);
+  } else {
+    if (exp_mode == 0) go(fa_kernel<3, 0, 128, true, true, true>, 128); else if (exp_mode == 1) go(fa_kernel<3, 1, 128, true, true, true>, 128); else go(fa_kernel<3, 2, 128, true, true, true>, 128);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+torch::Tensor fa_attention_split(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor qs, torch::Tensor ks, torch::Tensor vs,
+                                  torch::Tensor tab, torch::Tensor val, int Lq, int splits, double sm_scale, int exp_mode, double rescale_threshold,
+                                  torch::Tensor plan, torch::Tensor ws) {
+  check_packed(q, "q"); check_packed(k, "k"); check_packed(v, "v");
+  const c10::cuda::CUDAGuard guard(q.device());
+  const int H = q.size(0), nq = (Lq + BK - 1) / BK, NB = k.size(1), nblk = tab.numel();
+  TORCH_CHECK(splits >= 1 && splits <= nblk && q.size(1) == nq && v.size(1) == NB && qs.size(1) == nq && ks.size(1) == NB, "invalid split args");
+  TORCH_CHECK(tab.scalar_type() == torch::kInt32 && val.scalar_type() == torch::kInt32 && val.numel() == nblk, "invalid table");
+  TORCH_CHECK(ws.scalar_type() == torch::kFloat32 && ws.numel() >= int64_t(splits) * H * Lq * (D + 2), "workspace too small");
+  CUtensorMap km{}, vm{};
+  std::memcpy(&km, plan.data_ptr(), sizeof(km));
+  std::memcpy(&vm, plan.data_ptr<uint8_t>() + sizeof(km), sizeof(vm));
+  auto out = torch::empty({Lq, H, D}, q.options().dtype(torch::kBFloat16));
+  const float sl = float(sm_scale) * 1.4426950408889634f, th = rescale_threshold;
+  constexpr int qt = 128;
+  const int nt = qt * 2 + 32, smem = qt * D + 2 * stages(qt) * TILE + 64;
+  auto go = [&](auto kern) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    kern<<<dim3((Lq + qt - 1) / qt, H, splits), nt, smem, at::cuda::getCurrentCUDAStream()>>>(
+      q.data_ptr<uint8_t>(), k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(), qs.data_ptr<float>(), ks.data_ptr<float>(), vs.data_ptr<float>(),
+      out.data_ptr(), true, Lq, nblk * BK, H, sl, th, km, vm, tab.data_ptr<int>(), val.data_ptr<int>(), NB, ws.data_ptr<float>());
+  };
+  if (exp_mode == 0) go(fa_kernel<3, 0, 128, true, true, true, true>); else if (exp_mode == 1) go(fa_kernel<3, 1, 128, true, true, true, true>); else go(fa_kernel<3, 2, 128, true, true, true, true>);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  fa_combine<<<dim3(Lq, H), D, 0, at::cuda::getCurrentCUDAStream()>>>(ws.data_ptr<float>(), reinterpret_cast<__nv_bfloat16 *>(out.data_ptr()), Lq, H, splits);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("fa_attention_split", &fa_attention_split);
+  m.def("fa_attention_paged", &fa_attention_paged);
   m.def("fa_quant", &fa_quant, pybind11::arg("x"), pybind11::arg("packed"), pybind11::arg("scales"), pybind11::arg("start"),
         pybind11::arg("stop"), pybind11::arg("transpose"), pybind11::arg("target"), pybind11::arg("pow2") = false,
         pybind11::arg("int8") = false, pybind11::arg("mean") = pybind11::none());
