@@ -172,7 +172,8 @@ class Batcher:
 
 
 class GeneratedBatcher(Batcher):
-    def __init__(self, root, poses, batch, crop=8, ctx=2, seed=0, anchor=True):
+    def __init__(self, root, poses, batch, crop=8, ctx=2, seed=0, anchor=True, anchor_suffix=""):
+        self.anchor_suffix = anchor_suffix
         candidates = glob.glob(str(Path(root).expanduser()), recursive=True)
         files = set()
         for candidate in candidates:
@@ -187,8 +188,8 @@ class GeneratedBatcher(Batcher):
             windows = poses.windows.get(key, [])
             if not p.is_file() or not windows:
                 continue
-            if anchor and not Path(video).is_file():
-                raise FileNotFoundError(video)
+            if anchor and not Path(video[:-4] + anchor_suffix + ".mp4").is_file():
+                raise FileNotFoundError(video[:-4] + anchor_suffix + ".mp4")
             arr = np.load(p, mmap_mode="r")
             if arr.ndim != 4 or arr.shape[0] != 32 or tuple(arr.shape[2:]) != (LAT_H, LAT_W):
                 raise ValueError(f"invalid generated latent shape: {p}: {arr.shape}")
@@ -215,6 +216,11 @@ class GeneratedBatcher(Batcher):
         if s < self.ctx:
             z = torch.cat([z[:, :1].expand(-1, self.ctx - s, -1, -1), z], 1)
         return z
+
+    def _frames(self, spec):
+        i, s, ch, cw, cy, cx = spec
+        with torch.cuda.stream(self.stream):
+            return read_frames(self.paths[i][:-4] + self.anchor_suffix + ".mp4", 4 * s, 4 * self.win)[:, :, cy * 32: (cy + ch) * 32, cx * 32: (cx + cw) * 32]
 
     def _poses(self, spec):
         pose = super()._poses(spec)

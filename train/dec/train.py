@@ -179,7 +179,8 @@ def main(a):
     if ngen:
         gen_labels = load_poses(a.gen_labels or a.labels or "/workspace/data/gen_labels")
         gen_batcher = GeneratedBatcher(a.gen_root, gen_labels, ngen, a.crop, a.ctx, seed=a.seed + step + 1,
-                                       anchor=a.gen_anchor == "pixelumm" and a.w_gen_anchor > 0)
+                                       anchor=a.gen_anchor != "none" and (a.w_gen_anchor > 0 or a.w_gen_lpips > 0),
+                                       anchor_suffix="_dcae" if a.gen_anchor == "dcae" else "")
         print(json.dumps({"real_batch": nreal, "gen_batch": ngen, "gen_windows": len(gen_batcher.windows)}), flush=True)
     with torch.autocast("cuda", torch.bfloat16):
         flops_fwd = sum(count_flops(model, source.next()[0]) for source in (batcher, gen_batcher) if source is not None)
@@ -253,6 +254,10 @@ def main(a):
                                                      gauss_impl=a.gauss_impl, xview_src=a.xview_src))
                 if anchor is not None and a.w_gen_anchor > 0:
                     gen_parts["anchor"] = a.w_gen_anchor * anchor_loss(gyh, anchor, a.gen_anchor_sigma)
+                if anchor is not None and a.w_gen_lpips > 0:
+                    gb, _, gt = anchor.shape[:3]
+                    gsel = torch.randperm(gb * gt, device="cuda")[: a.perc_frames]
+                    gen_parts["lpips"] = a.w_gen_lpips * lp(frames(gyh, gsel), frames(anchor, gsel))
                 if not gen_parts:
                     raise ValueError("generated samples need an active Gaussian, anchor, or temporal smoothness loss")
                 parts = {**{"real_" + k: v * (nreal / a.batch) for k, v in real_parts.items()},
@@ -371,7 +376,8 @@ if __name__ == "__main__":
     p.add_argument("--gen_root", default="/workspace/data/gen", help="Generated rollout directory or glob; .npy latents need matching .mp4 files for anchors")
     p.add_argument("--gen_labels", default="", help="Generated label index or directory; falls back to --labels, then /workspace/data/gen_labels")
     p.add_argument("--gen_frac", type=float, default=0.0, help="Generated batch fraction rounded to samples (at least one when positive); losses weighted by actual sample fractions")
-    p.add_argument("--gen_anchor", choices=["pixelumm", "none"], default="pixelumm", help="Anchor 40-frame windows with the existing PixelUMM mp4; no DCAE-V decode")
+    p.add_argument("--gen_anchor", choices=["pixelumm", "dcae", "none"], default="pixelumm", help="Anchor 40-frame windows with the rollout's PixelUMM mp4 or its DCAE-V decode (<id>_dcae.mp4)")
+    p.add_argument("--w_gen_lpips", type=float, default=0.0, help="LPIPS between decoder RGB and the anchor on generated samples")
     p.add_argument("--w_gen_anchor", type=float, default=1.0, help="Weight of full-resolution Gaussian-blurred RGB L1 on generated samples only")
     p.add_argument("--gen_anchor_sigma", type=float, default=4.0, help="Spatial Gaussian anchor blur sigma in output pixels")
     p.add_argument("--temporal_smooth_w", type=float, default=0.0, help="Replace generated Gaussian losses with consecutive-frame RGB L1; keep anchor and real losses")
