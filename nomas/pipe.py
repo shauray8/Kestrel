@@ -271,6 +271,10 @@ def install():
             self.args.parallelism.dit_cpu_offload = False
             self.args.parallelism.text_encoder_cpu_offload = False
             self.args.vae.cpu_offload = False
+        if os.environ.get("NOMAS_DEC_GPU_OUT") == "1":
+            for obj in [self.vae, *getattr(self.vae, "modules", lambda: [])()]:
+                if getattr(obj, "decode_output_cpu", None) is True:
+                    obj.decode_output_cpu = False
         self._nomas_text_cache = {}
         self._nomas_text_ready = False
         self._nomas_original_encode = original_encode.__get__(self, type(self))

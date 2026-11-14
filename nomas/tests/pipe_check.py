@@ -16,6 +16,9 @@ from hymm.models.vae.pixelumm_decoder import maybe_load_pixelumm_decoder
 from hymm.pipeline.base import BasePipeline
 from hymm.pipeline.causal_ar import CPTCausalInferencePipeline
 from nomas.pipe import _BoundaryPatch, _DecodeJob, _cached_encode, _key, _patch_boundaries
+if os.environ.get("NOMAS_DEC_GEMM") == "n3":
+    from nomas import gemm
+    gemm.install()
 
 
 parser = argparse.ArgumentParser()
