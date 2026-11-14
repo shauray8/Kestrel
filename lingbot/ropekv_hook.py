@@ -1,10 +1,11 @@
-import math
+import math, os
 import torch
 
 def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False, qkv=None):
     ext = ops.rope_kv()
     original = mf.CausalWanSelfAttention.forward
     cache, programs, ends = {}, {}, {}
+    lazy_indices = os.environ.get("KV_IDX_LAZY") == "1"
 
     def tables(x, grid_sizes, freqs, start_frame):
         n, c = x.size(2), x.size(3) // 2
@@ -52,6 +53,10 @@ def install(mf, ops, vm=None, paths=None, enabled=lambda: True, fused_norm=False
     def attend(self, q, k, v, seq_lens, grid_sizes, freqs, kv_cache=None, current_start=0, max_attention_size=1_000_000,
                frame_seqlen=None, seq_lens_int=None, norm_in_vm=False):
         b, s, n, d = *q.shape[:2], self.num_heads, self.head_dim
+        if lazy_indices:
+            for name in ("global_end_index", "local_end_index"):
+                if kv_cache[name].is_cuda:
+                    kv_cache[name] = kv_cache[name].cpu()
         if frame_seqlen is None:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
         start_frame = current_start // frame_seqlen
