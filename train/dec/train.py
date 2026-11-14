@@ -186,9 +186,10 @@ def main(a):
     pynvml.nvmlInit()
     nh = pynvml.nvmlDeviceGetHandleByIndex(0)
     log = open(out / "log.jsonl", "a")
-    if a.mlflow:
-        import mlf
-        mlf.start(a.mlflow, out.name, vars(a))
+    wb = None
+    if a.wandb:
+        import wandb
+        wb = wandb.init(project=a.wandb, name=out.name, id=out.name, resume="allow", config=vars(a), dir=str(out))
     cf = 4 * a.ctx
     t_last, n_last = time.perf_counter(), step
     model.train()
@@ -291,16 +292,16 @@ def main(a):
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(json.dumps(rec), flush=True)
-            if a.mlflow:
-                mlf.log(rec, step)
+            if wb:
+                wb.log({k: v for k, v in rec.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "step"}, step=step)
         if step % a.eval_every == 0 or step == a.steps:
             ev = evaluate(ema.m, hlat, hpaths, a.eval_n)
             rec = {"step": step, "eval_ema": ev}
             log.write(json.dumps(rec) + "\n")
             log.flush()
             print(json.dumps(rec), flush=True)
-            if a.mlflow:
-                mlf.log(rec, step)
+            if wb:
+                wb.log({f"eval/{k}": v for k, v in ev.items()}, step=step)
             model.train()
         if step % a.ckpt_every == 0 or step == a.steps:
             save(ck, model=model.state_dict(), ema=ema.m.state_dict(), opts=[o.state_dict() for o in opts], step=step,
@@ -353,7 +354,7 @@ if __name__ == "__main__":
     p.add_argument("--keep_every", type=int, default=5000)
     p.add_argument("--init", default="")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--mlflow", default="")
+    p.add_argument("--wandb", default="")
     p.add_argument("--gauss", action="store_true")
     p.add_argument("--gauss_head_rgb", type=int, default=0)
     p.add_argument("--gauss_impl", choices=("batched", "loop"), default="batched", help="Gaussian rasterization implementation")
