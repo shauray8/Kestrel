@@ -95,9 +95,14 @@ class GaussHead(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, size="M", mean=None, std=None, grad_ckpt_from=99, gauss=False, gauss_rgb=True):
+    def __init__(self, size="M", mean=None, std=None, grad_ckpt_from=99, gauss=False, gauss_rgb=True, lookahead=0, extra_tail=0):
         super().__init__()
         widths, depths = CFG[size]
+        if lookahead not in (0, 1) or extra_tail not in (0, 1):
+            raise ValueError("lookahead and extra_tail must be 0 or 1")
+        self.lookahead, self.extra_tail = lookahead, extra_tail
+        if extra_tail:
+            depths = tuple(d + (i in (3, 4)) for i, d in enumerate(depths))
         self.size, self.widths, self.depths = size, widths, depths
         self.register_buffer("mean", (mean if mean is not None else torch.zeros(32)).view(1, 32, 1, 1, 1).float())
         self.register_buffer("std", (std if std is not None else torch.ones(32)).view(1, 32, 1, 1, 1).float())
@@ -111,10 +116,43 @@ class Decoder(nn.Module):
         if gauss:
             self.gauss_head = GaussHead(widths[self.gauss_stage], gauss_rgb)
         self.grad_ckpt_from = grad_ckpt_from
+        if lookahead:
+            self.proj_future = sconv(32, 4 * widths[0])
+            nn.init.zeros_(self.proj_future.weight)
+            nn.init.zeros_(self.proj_future.bias)
 
-    def forward(self, z, state=None, readouts=False, gauss=False):
+    def load_init_state_dict(self, weights):
+        prefixes = (("proj_future.",) if self.lookahead else ()) + tuple(
+            f"stages.{i}.{CFG[self.size][1][i]}." for i in (3, 4) if self.extra_tail)
+        new = {k: v for k, v in self.state_dict().items() if k not in weights and k.startswith(prefixes)}
+        return self.load_state_dict({**new, **weights})
+
+    def forward(self, z, state=None, readouts=False, gauss=False, final=False):
+        if self.lookahead and state is not None:
+            pending = state.pop("future_pending", None)
+            if pending is not None:
+                z = torch.cat((pending, z), 2)
+            if not final and z.shape[2]:
+                state["future_pending"] = z[:, :, -1:].detach()
         x = ((z.float() - self.mean) / self.std).to(z.dtype)
-        x = self.proj_in(x, state, "in")
+        if self.lookahead:
+            future = torch.cat((x[:, :, 1:], x[:, :, -1:]), 2) if state is None or final else x[:, :, 1:]
+            if state is not None and not final:
+                x = x[:, :, :-1]
+            if not x.shape[2]:
+                b, _, _, h, w = z.shape
+                y = z.new_empty(b, 3, 0, 32 * h, 32 * w)
+                ro = [z.new_empty(b, 3, 0, h * 2 ** i, w * 2 ** i) for i in READOUT_STAGES]
+                if gauss:
+                    channels = {"depth": 1, "opacity": 1, "log_scale": 3, "quat": 4}
+                    if self.gauss_head.rgb:
+                        channels["rgb"] = 3
+                    g = {k: z.new_empty(b, c, 0, 16 * h, 16 * w) for k, c in channels.items()}
+                outs = (y,) + ((ro,) if readouts else ()) + ((g,) if gauss else ())
+                return outs if len(outs) > 1 else y
+            x = self.proj_in(x, state, "in") + self.proj_future(future)
+        else:
+            x = self.proj_in(x, state, "in")
         b, c4, l, h, w = x.shape
         c = c4 // 4
         x = x.view(b, c, 4, l, h, w).permute(0, 1, 3, 2, 4, 5).reshape(b, c, 4 * l, h, w)
@@ -139,11 +177,16 @@ class Decoder(nn.Module):
     def decode_stream(self, z, chunk=10):
         state, outs = {}, []
         for i in range(0, z.shape[2], chunk):
-            outs.append(self(z[:, :, i:i + chunk], state=state))
+            if self.lookahead:
+                outs.append(self(z[:, :, i:i + chunk], state=state, final=i + chunk >= z.shape[2]))
+            else:
+                outs.append(self(z[:, :, i:i + chunk], state=state))
         return torch.cat(outs, 2)
 
     def param_groups(self):
         heads = [self.proj_in, self.out, *self.readouts.values()] + ([self.gauss_head] if hasattr(self, "gauss_head") else [])
+        if self.lookahead:
+            heads.append(self.proj_future)
         excluded = {id(p) for m in heads for p in m.parameters()}
         muon, adam = [], []
         for p in self.parameters():

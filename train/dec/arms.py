@@ -31,7 +31,8 @@ def load_student(path):
     weights = sd["ema"]
     gauss = any(k.startswith("gauss_head.") for k in weights)
     rgb = gauss and weights["gauss_head.net.3.bias"].numel() == 12
-    model = Decoder(sd["args"]["size"], gauss=gauss, gauss_rgb=rgb)
+    model = Decoder(sd["args"]["size"], gauss=gauss, gauss_rgb=rgb,
+                    lookahead=sd["args"].get("lookahead", 0), extra_tail=sd["args"].get("extra_tail", 0))
     model.load_state_dict(weights)
     return model.cuda().eval().requires_grad_(False)
 
@@ -50,7 +51,7 @@ def streamed(model, z, chunk):
     state, parts = {}, []
     with torch.autocast("cuda", torch.bfloat16):
         for i in range(0, z.shape[2], chunk):
-            parts.append(model(z[:, :, i:i + chunk], state=state).to("cpu", dtype=torch.bfloat16))
+            parts.append(model(z[:, :, i:i + chunk], state=state, final=i + chunk >= z.shape[2]).to("cpu", dtype=torch.bfloat16))
     return torch.cat(parts, 2)
 
 
@@ -241,20 +242,22 @@ def splat(a):
         raise ValueError("Requested 40-frame window exceeds latent rollout")
     state, cloud, decoded = {}, None, []
     with torch.inference_mode():
-        for i in range((a.start + 43) // 4):
+        for i in range(min(z.shape[2], (a.start + 43) // 4 + model.lookahead)):
+            begin = 4 * max(0, i - model.lookahead)
+            end = 4 * (i + 1 - model.lookahead) if i + 1 < z.shape[2] else 4 * z.shape[2]
             with torch.autocast("cuda", torch.bfloat16):
-                result = model(z[:, :, i:i + 1], state=state, gauss=4 * i + 4 > a.start)
-            if 4 * i + 4 <= a.start:
+                result = model(z[:, :, i:i + 1], state=state, gauss=end > a.start, final=i + 1 == z.shape[2])
+            if end <= a.start:
                 continue
             rgb, g = result
-            rgb = aligned(rgb, 4, "Gaussian decoder")
+            rgb = aligned(rgb, end - begin, "Gaussian decoder")
             h, w = g["depth"].shape[-2:]
             if cloud is None:
                 cloud = tuple(torch.empty((40 * h * w, d), device="cuda") if d > 1 else
                               torch.empty(40 * h * w, device="cuda") for d in (3, 4, 3, 1, 3))
             small = F.interpolate(rgb[0].transpose(0, 1).float(), (h, w), mode="area")
-            for j in range(4):
-                frame = 4 * i + j - a.start
+            for j in range(rgb.shape[2]):
+                frame = begin + j - a.start
                 if not 0 <= frame < 40:
                     continue
                 k = K[frame].clone()

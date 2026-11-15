@@ -109,6 +109,8 @@ def anchor_loss(pred, target, sigma):
 def main(a):
     if not 0 <= a.gen_frac <= 1:
         raise ValueError("--gen_frac must be in [0, 1]")
+    if a.lpips_jitter < 0:
+        raise ValueError("--lpips_jitter must be nonnegative")
     if a.gen_frac and (a.gen_anchor_sigma < 0 or a.w_gen_anchor < 0 or a.temporal_smooth_w < 0):
         raise ValueError("generated loss weights and blur sigma must be nonnegative")
     ngen = min(a.batch, max(1, round(a.batch * a.gen_frac))) if a.gen_frac else 0
@@ -126,14 +128,15 @@ def main(a):
     tr = list(range(len(paths)))
     print(json.dumps({"train_clips": len(paths), "train_T": lat.shape[2], "holdout_clips": len(hpaths)}), flush=True)
 
-    model = Decoder(a.size, st["mean"], st["std"], a.grad_ckpt_from, gauss=a.gauss, gauss_rgb=bool(a.gauss_head_rgb)).cuda().to(memory_format=torch.channels_last_3d)
+    model = Decoder(a.size, st["mean"], st["std"], a.grad_ckpt_from, gauss=a.gauss, gauss_rgb=bool(a.gauss_head_rgb),
+                    lookahead=a.lookahead, extra_tail=a.extra_tail).cuda().to(memory_format=torch.channels_last_3d)
     lat_std = st["std"].cuda().view(1, 32, 1, 1, 1)
     if a.init:
         sd = torch.load(a.init, map_location="cuda", weights_only=False)
         init_sd = sd["ema"] if "ema" in sd else sd["model"]
         if a.gauss:
             init_sd = {**{k: v for k, v in model.state_dict().items() if k.startswith("gauss_head.")}, **init_sd}
-        model.load_state_dict(init_sd)
+        model.load_init_state_dict(init_sd)
     if a.qat:
         print(json.dumps({"qat_layers": apply_qat(model, a.qat_min_ch)}), flush=True)
     muon_p, adam_p = model.param_groups()
@@ -146,10 +149,10 @@ def main(a):
     base_lrs = [[g["lr"] for g in o.param_groups] for o in opts]
     ema = EMA(model, a.ema_half_life, a.ema_start)
 
-    lp = LPIPS().cuda()
-    dino = Dino().cuda() if (a.w_pdino > 0 or a.gan_start < a.steps) else None
+    lp = LPIPS(jitter=a.lpips_jitter).cuda()
+    dino = Dino().cuda() if nreal and (a.w_pdino > 0 or a.gan_start < a.steps) else None
     pd = PDino(dino) if dino is not None and a.w_pdino > 0 else None
-    disc = Disc(dino).cuda() if a.gan_start < a.steps else None
+    disc = Disc(dino).cuda() if nreal and a.gan_start < a.steps else None
     dopt = torch.optim.AdamW(disc.heads.parameters(), lr=a.d_lr, betas=(0.0, 0.99), fused=True) if disc else None
 
     step = 0
@@ -322,6 +325,8 @@ if __name__ == "__main__":
     p.add_argument("--out", required=True)
     p.add_argument("--latents", default="/workspace/data/latents")
     p.add_argument("--size", default="S", choices=["S", "M", "L"])
+    p.add_argument("--lookahead", type=int, choices=(0, 1), default=0, help="Add a zero-initialized next-latent projection; streaming delays one latent and flushes at sequence end")
+    p.add_argument("--extra_tail", type=int, choices=(0, 1), default=0, help="Append zero-output residual blocks at stages 3 and 4")
     p.add_argument("--opt", default="muon", choices=["muon", "adamw"])
     p.add_argument("--steps", type=int, default=10000)
     p.add_argument("--batch", type=int, default=16)
@@ -337,6 +342,7 @@ if __name__ == "__main__":
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--ns_steps", type=int, default=5)
     p.add_argument("--w_lpips", type=float, default=0.1)
+    p.add_argument("--lpips_jitter", type=int, default=0, help="Paired reflect-pad/crop LPIPS shifts sampled once per call from 0..N; pixel/readout losses stay unchanged")
     p.add_argument("--w_pdino", type=float, default=0.01)
     p.add_argument("--w_readout", type=float, default=1.0)
     p.add_argument("--w_temporal", type=float, default=0.0)

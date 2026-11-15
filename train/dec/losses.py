@@ -42,11 +42,18 @@ class PDino(nn.Module):
 
 
 class LPIPS(nn.Module):
-    def __init__(self):
+    def __init__(self, jitter=0):
         super().__init__()
+        self.jitter = jitter
         self.net = lpips.LPIPS(net="vgg", verbose=False).eval().requires_grad_(False)
 
     def forward(self, x, y):
+        if self.jitter:
+            n = self.jitter
+            dy, dx = torch.randint(n + 1, (2,)).tolist()
+            h, w = x.shape[-2:]
+            x = F.pad(x, (n, n, n, n), mode="reflect")[..., n + dy:n + dy + h, n + dx:n + dx + w]
+            y = F.pad(y, (n, n, n, n), mode="reflect")[..., n + dy:n + dy + h, n + dx:n + dx + w]
         return self.net(x.float(), y.float()).mean()
 
 
